@@ -154,6 +154,11 @@ is an alert. Tell the user plainly: until that stop is placed nothing at the
 broker limits the loss, and a stop-limit can skip past its limit in a crash
 and not fill at all. The max loss shown is the loss at the stop price.
 
+With `"broker": "ibkr"` the buy is a limit order at the plan's entry,
+immediate or cancel (IBKR sizes a crypto market buy in cash, not coins), and
+there is no stop at the broker at all: IBKR takes no stop orders on crypto.
+The stop and the target are alerts, and the user sells by hand.
+
 ## Rules
 
 - Proposals only. This skill never calls a broker tool.

@@ -150,6 +150,11 @@ What changes on the way to an order:
   stop-limit can skip past its limit in a crash.
 - **24/7.** A coin can gap through your stop at 3 a.m. on a Sunday. The
   midnight-UTC opening range is a convention, not an opening bell.
+- **Interactive Brokers** (`"broker": "ibkr"`, MiCA-licensed in the EU):
+  IBKR takes no stop orders on crypto. The buy is a limit at the entry,
+  immediate or cancel; the stop and the target are alerts only, and you sell
+  by hand (`ticket.py flatten` writes a marketable limit sell). Nothing at the
+  broker stops you out.
 
 ## The tools
 

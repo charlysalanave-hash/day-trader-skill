@@ -29,7 +29,9 @@ What blocks an order (every order):
                 that is not a stock or ETF
   crypto        with "allow_crypto": true: no bracket (Alpaca has none for
                 coins), time_in_force gtc or ioc, market / limit / stop_limit
-                only. Its window is the config's "crypto" section, in UTC
+                only. With "broker": "ibkr": limit (day, gtc, ioc) or market
+                (ioc, cash amount) only: Interactive Brokers takes no stop
+                orders on crypto. Its window is the config's "crypto" section, in UTC
                 (default 00:20 to 23:00, every day: the market never closes).
                 Daily limits still count by the New York date, for everything.
   short         selling more than you hold, unless "allow_short": true
@@ -98,6 +100,8 @@ CRYPTO = re.compile(r"^[A-Z0-9]{2,10}-(USD|USDT|USDC|EUR|GBP)$")
 CRYPTO_WINDOW = {"no_entries_before": "00:20", "no_entries_after": "23:00"}  # UTC, every day
 CRYPTO_TYPES = {"market", "limit", "stop_limit"}
 CRYPTO_TIFS = {"gtc", "ioc"}
+IBKR_CRYPTO_TYPES = {"market", "limit"}          # IBKR: no stop orders on crypto
+IBKR_CRYPTO_TIFS = {"limit": {"day", "gtc", "ioc"}, "market": {"ioc"}}
 REF_WORDS = {"plan": "the plan's entry", "price": "the latest price", "limit": "the limit price",
              "stop price": "the stop price", "stale price": "an old price"}
 
@@ -460,6 +464,7 @@ def check(orders, cfg, portfolio=None, prices=None, state=None, today=None, now=
         bracket = oc == "bracket" or (not oc and legs)
         value = None
         coin = is_crypto(sym)
+        ibkr = str(c.get("broker") or "alpaca").lower() == "ibkr"
 
         # format
         if not sym:
@@ -480,9 +485,10 @@ def check(orders, cfg, portfolio=None, prices=None, state=None, today=None, now=
             reasons.append("format: unknown order type %r" % typ)
         if tif not in TIFS:
             reasons.append("format: unknown time_in_force %r" % tif)
-        if notional is not None and (typ != "market" or tif != ("gtc" if coin else "day")):
+        want_tif = ("ioc" if ibkr else "gtc") if coin else "day"
+        if notional is not None and (typ != "market" or tif != want_tif):
             reasons.append("format: a notional (dollar) order must be a market order with time_in_force %s"
-                           % ("gtc" if coin else "day"))
+                           % want_tif)
         if typ in ("limit", "stop_limit") and o.get("limit_price") is None:
             reasons.append("format: a %s order needs a limit_price" % typ)
         if typ in ("stop", "stop_limit") and o.get("stop_price") is None:
@@ -491,7 +497,22 @@ def check(orders, cfg, portfolio=None, prices=None, state=None, today=None, now=
             reasons.append("format: extended hours needs a limit order with time_in_force day or gtc")
         if o.get("stop_loss_limit_price") is not None and o.get("stop_loss_stop_price") is None:
             reasons.append("format: stop_loss_limit_price needs a stop_loss_stop_price")
-        if coin and c.get("allow_crypto"):
+        if coin and c.get("allow_crypto") and ibkr:
+            if bracket or oc:
+                reasons.append("crypto: Interactive Brokers takes no bracket or OCO orders for crypto: buy "
+                               "alone; the stop is an alert (trader-alerts)")
+            if typ not in IBKR_CRYPTO_TYPES:
+                reasons.append("crypto: Interactive Brokers takes limit or market orders for crypto, no stop "
+                               "orders (got %r): the stop is an alert, and you sell by hand" % typ)
+            elif tif not in IBKR_CRYPTO_TIFS[typ]:
+                reasons.append("crypto: on Interactive Brokers a crypto %s order takes time_in_force %s, not %r"
+                               % (typ, " or ".join(sorted(IBKR_CRYPTO_TIFS[typ])), tif))
+            if typ == "market" and side == "buy" and notional is None:
+                reasons.append("crypto: Interactive Brokers sizes a crypto market buy in cash (notional): "
+                               "use a limit order for an exact quantity")
+            if o.get("extended_hours"):
+                reasons.append("crypto: extended_hours means nothing for crypto: leave it out")
+        elif coin and c.get("allow_crypto"):
             if bracket or oc:
                 reasons.append("crypto: Alpaca takes no bracket or OCO orders for crypto: buy alone, then "
                                "protect it with a stop-limit sell once it fills (ticket.py protect)")
@@ -628,7 +649,12 @@ def check(orders, cfg, portfolio=None, prices=None, state=None, today=None, now=
             if leg_stop and plan_stop and abs(leg_stop - plan_stop) > CENT:
                 warns.append("the bracket stop %s differs from the plan's stop %s: the bracket's is the one "
                              "the broker uses" % (_p(leg_stop), _p(plan_stop)))
-            if stop and not leg_stop and coin:
+            if stop and not leg_stop and coin and ibkr:
+                warns.append("NO STOP AT THE BROKER: Interactive Brokers takes no stop orders on crypto. The stop "
+                             "%s is an alert only (alerts.py add --from-plan): when it rings, sell by hand "
+                             "(ticket.py flatten). Away from the screen, the loss can run far past the max loss"
+                             % _p(stop))
+            elif stop and not leg_stop and coin:
                 warns.append("the stop %s is in the plan only: once the buy fills, place the stop-limit sell "
                              "(trader-broker: ticket.py protect) and set the alerts (alerts.py add --from-plan)"
                              % _p(stop))

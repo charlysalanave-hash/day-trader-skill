@@ -223,6 +223,31 @@ Until step 2 is placed, nothing at the broker limits the loss: say so. A
 stop-limit only sells at its limit or better; in a crash it can skip past it
 and not fill at all. Crypto trades all night and all weekend.
 
+**Crypto on Interactive Brokers** (`"broker": "ibkr"`; IBKR Ireland holds a
+MiCA licence for crypto, so it serves France and the EU). IBKR takes only
+limit orders (by quantity; DAY, GTC or IOC) and market orders (by cash; IOC)
+on crypto: **no stop orders at all**. So:
+
+1. The buy is a limit at the plan's entry, immediate or cancel: it fills now
+   at the entry or better, or not at all. The ticket prints the draft in
+   IBKR's words (`contract`, `action`, `orderType`, `totalQuantity`,
+   `lmtPrice`, `tif`); find the contract with the connector's
+   `search_contracts` (the coin, crypto, USD), draft it, and the user
+   approves it in IBKR (AI Instructions, Review and Submit).
+2. There is no `protect`: it refuses. The stop and the target are alerts
+   only (`alerts.py add --from-plan`, then `alerts.py check` every few
+   minutes). Tell the user plainly: nothing at the broker stops them out, and
+   if they are away when the stop alert rings, the loss runs on.
+3. Getting out: `ticket.py flatten --symbol BTC-USD` writes a marketable
+   limit sell, 0.5 % under the last price in `trader/prices.json` (or
+   `--limit PRICE`), immediate or cancel. trader-risk, the user's yes, the
+   draft, the user's approval in IBKR. If it does not fill, a new ticket with
+   a lower limit.
+
+Whether the IBKR connector drafts crypto orders, and whether a paper account
+trades crypto in the EU, was not confirmed when this was written: check in
+IBKR before relying on it.
+
 ## What it never does
 
 - Never places an order without all three gates, and never two orders on one yes.

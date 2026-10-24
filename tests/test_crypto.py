@@ -341,6 +341,90 @@ class Chain(Workspace):
         self.assertEqual(rings, [])          # the plan's UTC day is over
 
 
+class InteractiveBrokers(Chain):
+    """"broker": "ibkr": IBKR takes limit (by quantity) and market (by cash) crypto orders, no stops."""
+
+    def setUp(self):
+        super(InteractiveBrokers, self).setUp()
+        with open(self.p("trader", "config.json"), "w") as fh:
+            json.dump(dict(CRYPTO_CFG, broker="ibkr"), fh)
+
+    def risk(self, cfg=None, now="2026-10-24 00:30"):
+        return super(InteractiveBrokers, self).risk(cfg or dict(CRYPTO_CFG, broker="ibkr"), now)
+
+    def test_the_buy_is_a_limit_ioc_for_the_exact_quantity(self):
+        out = self.orders_json()
+        self.assertIn("NOTHING at the broker will stop you out", out)
+        o = self.read("trader/orders.json")["orders"][0]
+        self.assertEqual({k: o[k] for k in ("qty", "type", "limit_price", "time_in_force", "broker")},
+                         {"qty": "0.055654", "type": "limit", "limit_price": "67380.00", "time_in_force": "ioc",
+                          "broker": "ibkr"})
+        self.assertNotIn("stop_limit_price", o["plan"])
+
+    def test_risk_warns_there_is_no_stop_at_the_broker(self):
+        self.orders_json()
+        code, out, _ = self.risk()
+        self.assertEqual(code, 0, out)
+        self.assertIn("NO STOP AT THE BROKER: Interactive Brokers takes no stop orders on crypto", out)
+
+    def test_risk_blocks_a_crypto_stop_order_and_a_market_buy_by_quantity(self):
+        cfg = dict(CRYPTO_CFG, broker="ibkr")
+        now = datetime.datetime(2026, 10, 24, 0, 30)
+        res = check.check([{"symbol": "BTC-USD", "side": "buy", "qty": "0.01", "type": "market",
+                            "time_in_force": "ioc", "plan": {"entry": 67380, "stop": 67025, "target": 68090}},
+                           {"symbol": "ETH-USD", "side": "buy", "qty": "0.5", "type": "stop_limit",
+                            "stop_price": "2500", "limit_price": "2490", "time_in_force": "gtc",
+                            "plan": {"entry": 2490, "stop": 2450, "target": 2600}}], cfg, now=now)
+        self.assertIn("sizes a crypto market buy in cash", " ".join(res["results"][0]["reasons"]))
+        self.assertIn("no stop orders", " ".join(res["results"][1]["reasons"]))
+
+    def test_the_ticket_is_an_ibkr_draft(self):
+        self.orders_json()
+        self.risk()
+        code, out, _ = run(ticket.main, ["show", "--index", "1", "--json", "--orders", self.p("trader", "orders.json"),
+                                         "--config", self.p("trader", "config.json"), "--risk",
+                                         self.p("trader", "state", "risk.json"), "--state",
+                                         self.p("trader", "state", "broker.json"), "--now", "2026-10-24T00:30Z"])
+        t = json.loads(out)
+        self.assertTrue(t["ready"], t["status"])
+        self.assertEqual(t["tool"], "ibkr connector (draft)")
+        self.assertEqual(t["tool_input"], {"contract": {"symbol": "BTC", "secType": "CRYPTO", "currency": "USD"},
+                                           "action": "BUY", "orderType": "LMT", "tif": "IOC",
+                                           "totalQuantity": "0.055654", "lmtPrice": "67380.00"})
+        self.assertIn("NO stop at the broker", t["plain"])
+
+    def test_protect_refuses_and_flatten_is_a_marketable_limit(self):
+        code, _, err = run(ticket.main, ["protect", "--symbol", "BTC-USD", "--qty", "0.05", "--config",
+                                         self.p("trader", "config.json"), "--orders", self.p("o.json")])
+        self.assertEqual(code, 1)
+        self.assertIn("Interactive Brokers takes no stop orders on crypto", err)
+        prices = self.write("prices.json", {"prices": {"BTC-USD": 67100}})
+        code, _, err = run(ticket.main, ["flatten", "--symbol", "BTC-USD", "--qty", "0.055654", "--orders",
+                                         self.p("o.json"), "--plan", self.p("none.json"), "--config",
+                                         self.p("trader", "config.json"), "--prices", prices, "--now",
+                                         "2026-10-24T23:55Z"])
+        self.assertEqual(code, 0, err)
+        o = self.read("o.json")["orders"][0]
+        self.assertEqual((o["type"], o["limit_price"], o["time_in_force"]), ("limit", "66764.50", "ioc"))
+        res = check.check([o], dict(CRYPTO_CFG, broker="ibkr"),
+                          portfolio={"cash": 0, "positions": [{"ticker": "BTC-USD", "shares": 0.055654}]},
+                          now=datetime.datetime(2026, 10, 24, 23, 56))
+        self.assertEqual((res["results"][0]["kind"], res["results"][0]["verdict"]), ("exit", "PASS"))
+
+    def test_flatten_without_a_price_asks_for_one(self):
+        code, _, err = run(ticket.main, ["flatten", "--symbol", "BTC-USD", "--qty", "0.05", "--orders",
+                                         self.p("o.json"), "--plan", self.p("none.json"), "--config",
+                                         self.p("trader", "config.json"), "--prices", self.p("none.json")])
+        self.assertEqual(code, 1)
+        self.assertIn("needs a limit price", err)
+
+    # the Alpaca-only steps of the chain do not apply here
+    test_broker_ticket_goes_to_place_crypto_order = None
+    test_protect_refuses_a_stock_and_flatten_is_gtc_for_crypto = None
+    test_budget_sizes_in_millionths_of_a_coin = None
+    test_risk_blocks_crypto_unless_allowed = None
+
+
 class TimeMachine(Workspace):
     def plan(self, **kw):
         p = {"symbol": "BTC-USD", "side": "buy", "date": DAY, "entry": 79420.88, "stop": 79200.0,

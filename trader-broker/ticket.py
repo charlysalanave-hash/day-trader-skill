@@ -181,6 +181,28 @@ def is_crypto(sym):
     return bool(CRYPTO.match(str(sym or "").strip().upper()))
 
 
+def is_ibkr(cfg):
+    return str((cfg or {}).get("broker", "alpaca")).lower() == "ibkr"
+
+
+def ibkr_draft(order):
+    """What Claude asks the Interactive Brokers connector to draft for a crypto order, in IBKR's
+    own order words. IBKR takes limit (by quantity) and market (by cash) orders on crypto, no stops.
+    The contract comes from the connector's search_contracts (the coin, crypto, USD)."""
+    d = {"contract": {"symbol": str(order.get("symbol", "")).upper().split("-")[0], "secType": "CRYPTO",
+                      "currency": str(order.get("symbol", "")).upper().split("-")[-1]},
+         "action": str(order.get("side", "")).upper(),
+         "orderType": "LMT" if order.get("type") == "limit" else "MKT",
+         "tif": str(order.get("time_in_force", "ioc")).upper()}
+    if order.get("notional") is not None:
+        d["cashQty"] = _str_num(order["notional"])
+    else:
+        d["totalQuantity"] = _str_num(order.get("qty"))
+    if order.get("limit_price") is not None:
+        d["lmtPrice"] = _str_num(order["limit_price"])
+    return d
+
+
 def tool_name(order):
     return "place_crypto_order" if is_crypto(order.get("symbol")) else "place_stock_order"
 
@@ -278,10 +300,16 @@ def plain_parts(order):
     parts = ["%s %s, %s, %s" % (side, what, how, tif)]
     if is_crypto(sym) and str(order.get("side", "")).lower() == "buy":
         plan = order.get("plan") or {}
-        if plan.get("stop"):
+        if plan.get("stop") and order.get("broker") == "ibkr":
+            parts.append("NO stop at the broker (IBKR takes none on crypto): the stop %s is an alert, you sell "
+                         "by hand" % _p(plan["stop"]))
+        elif plan.get("stop"):
             parts.append("no stop at the broker yet: after the fill, ticket.py protect (stop %s)" % _p(plan["stop"]))
         loss, stop = max_loss(order)
-        if loss is not None:
+        if loss is not None and order.get("broker") == "ibkr":
+            parts.append("max loss about %s if you sell at %s when the alert rings (later means worse)"
+                         % (_money(loss), _p(stop)))
+        elif loss is not None:
             parts.append("max loss about %s if the stop fills at %s (it can fill worse, or not at all)"
                          % (_money(loss), _p(stop)))
     return parts
@@ -404,6 +432,10 @@ def render(order, idx, total, cfg, risk, state, today):
     if broker == "ibkr":
         lines.append("  Claude drafts this with the Interactive Brokers connector. IBKR sends it to your")
         lines.append("  IBKR account, and it only goes to the market after you approve it there.")
+        if is_crypto(order.get("symbol")):
+            lines.append("  The draft, in IBKR's words (find the contract with search_contracts first):")
+            for l in json.dumps(ibkr_draft(order), indent=2).splitlines():
+                lines.append("    " + l)
     else:
         lines.append("  Claude will call %s with exactly:" % tool_name(order))
         for l in json.dumps(tool_input(order), indent=2).splitlines():
@@ -423,8 +455,9 @@ def ticket_json(order, idx, cfg, risk, state, today):
     loss, stop = max_loss(order)
     return {"index": idx, "ready": ready, "status": label, "plain": plain(order),
             "fingerprint": fingerprint(order), "paper": bool(cfg.get("paper", True)),
-            "broker": cfg.get("broker", "alpaca"), "tool": tool_name(order),
-            "tool_input": tool_input(order), "why": order.get("why", ""),
+            "broker": cfg.get("broker", "alpaca"),
+            "tool": "ibkr connector (draft)" if is_ibkr(cfg) else tool_name(order),
+            "tool_input": ibkr_draft(order) if is_ibkr(cfg) and is_crypto(order.get("symbol")) else tool_input(order), "why": order.get("why", ""),
             "bracket": is_bracket(order), "max_loss": loss, "stop": stop}
 
 
@@ -557,6 +590,9 @@ def cmd_approve(a):
     print("Recorded your yes for order %d: %s." % (a.index, plain(order)))
     if str(cfg.get("broker", "alpaca")).lower() == "ibkr":
         print("Now draft it with the Interactive Brokers connector; approve it in your IBKR account.")
+        if is_crypto(order.get("symbol")):
+            print("The draft, in IBKR's words (find the contract with search_contracts first):")
+            print(json.dumps(ibkr_draft(order), indent=2))
     else:
         print("Now call %s with exactly:" % tool_name(order))
         print(json.dumps(tool_input(order), indent=2))
@@ -657,6 +693,21 @@ def cmd_flatten(a):
              % (flat_by, "UTC" if coin else "New York", sym, "midnight UTC" if coin else "the close", source)}
     if coin:
         order["asset_class"] = "crypto"
+    if coin and is_ibkr(cfg):
+        # IBKR sells crypto by quantity with a limit: a marketable limit under the last price
+        limit = _f(a.limit)
+        if limit is None:
+            pdoc = read_json(a.prices, "prices", required=False) or {}
+            last = _f((pdoc.get("prices") or {}).get(sym))
+            if not last:
+                raise TicketError("Interactive Brokers needs a limit price to sell crypto by quantity: pass "
+                                  "--limit PRICE, or get a price first (alerts.py quote %s --write)" % sym)
+            limit = int(last * (1 - STOP_LIMIT_PCT / 100.0) * 100 + 0.5) / 100.0
+        if limit <= 0:
+            raise TicketError("--limit must be a price above 0")
+        order.update({"type": "limit", "limit_price": _p(limit), "time_in_force": "ioc", "broker": "ibkr"})
+        order["why"] += "; a limit at %s, immediate or cancel: if the price is already under it, nothing sells" \
+            % _p(limit)
     old = read_json(a.orders, "orders", required=False)
     replaced = len(old.get("orders", [])) if isinstance(old, dict) else 0
     doc = {"created_by": "trader-broker", "created_at": now.strftime("%Y-%m-%dT%H:%M:%SZ"), "status": "proposed",
@@ -673,6 +724,10 @@ def cmd_flatten(a):
     print("  1. trader-risk: check.py. A sell that only closes what you hold is never blocked by the daily")
     print("     limits or the entry window.")
     print("  2. ticket.py show, then the user's yes for this one order.")
+    if coin and is_ibkr(cfg):
+        print("  3. Claude drafts it with the Interactive Brokers connector; you approve it in IBKR. If it does")
+        print("     not fill (the price fell under the limit), make a new ticket with a lower --limit.")
+        return 0
     if coin:
         print("  3. If the protective stop-limit is still open, Alpaca holds these coins for it and rejects a")
         print("     new sell. Cancel it first: get_orders (status open), then cancel_order_by_id (Needs")
@@ -690,6 +745,10 @@ def cmd_protect(a):
     sym = a.symbol.strip().upper()
     if not is_crypto(sym):
         raise TicketError("protect is for crypto pairs (BTC-USD): a stock's stop rides in its bracket order")
+    if is_ibkr(cfg):
+        raise TicketError("Interactive Brokers takes no stop orders on crypto, so there is no stop to place: the "
+                          "stop is an alert (alerts.py add --from-plan). When it rings, sell by hand: ticket.py "
+                          "flatten --symbol %s" % sym)
     now, today = _clock(a)
     plan = read_json(a.plan, "plan", required=False) or {}
     if str(plan.get("symbol", "")).upper() != sym and a.stop is None:
@@ -805,6 +864,9 @@ def main(argv=None):
     p.add_argument("--portfolio", default="trader/portfolio.json")
     p.add_argument("--plan", default="trader/plan.json")
     p.add_argument("--config", default="trader/config.json")
+    p.add_argument("--limit", help="IBKR crypto: the sell's limit price (default: 0.5 %% under the last price "
+                                   "in trader/prices.json)")
+    p.add_argument("--prices", default="trader/prices.json")
     clock(p)
     p = sub.add_parser("protect", help="crypto: the stop-limit sell at the plan's stop, after the buy fills")
     p.add_argument("--symbol", required=True)

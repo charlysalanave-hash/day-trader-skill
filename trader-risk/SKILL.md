@@ -163,6 +163,11 @@ crypto, `--now` is read as UTC. The protective stop-limit sell from
 `ticket.py protect` is an exit, so it is never blocked by the window or the
 day limits.
 
+With `"broker": "ibkr"`, a crypto order must be a limit (day, gtc or ioc) or
+a market order sized in cash (ioc): Interactive Brokers takes no stop orders
+on crypto, so a stop or stop-limit is BLOCKED, and every crypto entry carries
+the warning that nothing at the broker will stop it out.
+
 ## Rules
 
 - A PASS only means the order is allowed to be shown to the user. It is not a yes.

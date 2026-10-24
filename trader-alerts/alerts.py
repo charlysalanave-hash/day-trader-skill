@@ -652,8 +652,9 @@ def cmd_check(a):
                   "the broker: check get_open_position and record any fill (ticket.py fill). To close a "
                   "position yourself: ticket.py flatten, then trader-risk and your yes.")
             if any(is_crypto(r.get("symbol")) for r in rings):
-                print("Crypto has no bracket: only the stop-limit from ticket.py protect sits at the broker. "
-                      "At the target, cancel that stop and sell (ticket.py flatten).")
+                print("Crypto has no bracket: on Alpaca only the stop-limit from ticket.py protect sits at the "
+                      "broker (cancel it, then sell); on Interactive Brokers nothing does, so sell by hand now "
+                      "if you are getting out (ticket.py flatten).")
     return 0 if rings else 1
 
 
@@ -681,8 +682,9 @@ def cmd_add(a):
         print("Run alerts.py check every few minutes while the trade is open (a scheduled task or /loop). "
               "Free quotes are delayed; the broker's bracket orders are what actually stop you out.")
         if coin:
-            print("Crypto has no bracket: the target is this alert only, and the stop at the broker is the "
-                  "stop-limit from ticket.py protect. Place it as soon as the buy fills.")
+            print("Crypto has no bracket: the target is this alert only. On Alpaca the stop at the broker is "
+                  "the stop-limit from ticket.py protect (place it as soon as the buy fills); on Interactive "
+                  "Brokers there is none, so this stop alert is all there is: keep checking.")
         return 0
     if a.opening_bell:
         rule = {"id": a.id or "opening-bell", "type": "opening_bell"}

@@ -467,6 +467,7 @@ def size_trade(plan, cfg, budget=None, limit=None, price=None, cash=None, today=
         "max_loss_per_trade_usd": max_loss, "limits": limits, "qty": qty, "bound_by": bound[0],
         "cost": cost, "max_loss": loss, "flat_by": plan.get("flat_by") or c.get("flat_by"),
         "order_type": "limit" if limit is not None else "market", "refusal": refusal,
+        "broker": str(c.get("broker") or "alpaca").lower(),
     }
 
 
@@ -474,8 +475,11 @@ def crypto_order(s):
     """Crypto: Alpaca has no bracket orders for coins, so the proposal is the buy alone
     (good until canceled: the market never closes). Its plan carries the stop and the
     target; once it fills, trader-broker's protect writes the stop-limit sell at the stop."""
+    ibkr = s.get("broker") == "ibkr"
+    # IBKR sizes a crypto market buy in cash, so the buy is a limit order for the exact
+    # quantity, immediate or cancel: it fills now at the entry or better, or not at all
     o = {"symbol": s["symbol"], "side": "buy", "qty": qty_str(s["qty"]), "type": s["order_type"],
-         "time_in_force": "gtc", "asset_class": "crypto"}
+         "time_in_force": "ioc" if ibkr else "gtc", "asset_class": "crypto"}
     if s["order_type"] == "limit":
         o["limit_price"] = _price(s["entry"])
     setup = SETUP_WORDS.get(s["setup"], s["setup"] or "day trade")
@@ -491,6 +495,11 @@ def crypto_order(s):
                  "stop_limit_price": round_cent(s["stop"] * (1 - STOP_LIMIT_PCT / 100.0)),
                  "protect": "after the fill: trader-broker protect writes a stop-limit sell at the stop"},
     })
+    if ibkr:
+        o["broker"] = "ibkr"
+        del o["plan"]["stop_limit_price"]
+        o["plan"]["protect"] = ("IBKR takes no stop orders on crypto: the stop is an alert (trader-alerts), "
+                                "and you sell by hand when it rings (trader-broker flatten)")
     return o
 
 
@@ -552,8 +561,25 @@ def plan_report(s, order, notes=()):
     lines.append("Size: %s of %s = %s at %s. Max loss at the stop: %s x %s = %s."
                  % (units(s["qty"], s["symbol"]), s["symbol"], money(s["cost"]), _price(s["entry"]),
                     qty_str(s["qty"]), _price(s["risk_per_share"]), money(s["max_loss"])))
-    lines.append("A stop is an order, not a promise: in a fast market it can fill below %s." % _price(s["stop"]))
+    if not (MARKET["crypto"] and s.get("broker") == "ibkr"):
+        lines.append("A stop is an order, not a promise: in a fast market it can fill below %s." % _price(s["stop"]))
     lines.append("")
+    if MARKET["crypto"] and s.get("broker") == "ibkr":
+        lines.append("Proposed crypto order (Interactive Brokers, nothing has been placed):")
+        lines.append("  buy %s %s, limit %s, immediate or cancel (it fills now at %s or better, or not at all)"
+                     % (order["qty"], order["symbol"], order["limit_price"], order["limit_price"]))
+        lines.append("IBKR takes no stop orders on crypto: NOTHING at the broker will stop you out. The stop %s "
+                     "and the target %s are alerts (trader-alerts); when one rings you sell by hand "
+                     "(trader-broker flatten). Away from the screen, the loss can run far past %s."
+                     % (_price(s["stop"]), _price(s["target"]), money(s["max_loss"])))
+        if s["flat_by"]:
+            lines.append("Flat by %s UTC: anything still open then gets sold (trader-alerts rings, "
+                         "trader-broker flatten)." % s["flat_by"])
+        lines.append("")
+        lines.append("Next: trader-risk checks it (crypto needs \"allow_crypto\": true in your config), then "
+                     "trader-broker drafts it in IBKR, where you approve it yourself.")
+        lines.append("Education and tooling, not financial advice.")
+        return "\n".join(lines)
     if MARKET["crypto"]:
         how = "limit %s" % order["limit_price"] if order["type"] == "limit" else "market"
         lines.append("Proposed crypto order (place_crypto_order, nothing has been placed):")
@@ -888,6 +914,10 @@ def run_plan(a, cfg):
                 raise SizeError("--limit wants a price, like --limit 364.00")
     sym = str((plan or {}).get("symbol") or "").upper()
     notes, price = [], None
+    if MARKET["crypto"] and str(cfg.get("broker") or "").lower() == "ibkr" and limit is None:
+        limit = _f((plan or {}).get("entry"))
+        notes.append("Interactive Brokers sizes a crypto market buy in cash, not coins: this is a limit order at "
+                     "the plan's entry %s instead, for the exact quantity." % _price(limit or 0))
     ppath = a.prices or ("trader/prices.json" if os.path.exists("trader/prices.json") else None)
     if ppath and limit is None and sym:
         pdoc = read_json(ppath, "prices")
