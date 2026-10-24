@@ -25,7 +25,13 @@ What blocks an order (every order):
                 a limit order without a limit price, unknown type; a bracket
                 that is not whole shares, not day / gtc, or misses a leg
   asset         options (OCC symbols) unless "allow_options": true; crypto
-                and anything that is not a stock or ETF
+                pairs (BTC-USD) unless "allow_crypto": true; anything else
+                that is not a stock or ETF
+  crypto        with "allow_crypto": true: no bracket (Alpaca has none for
+                coins), time_in_force gtc or ioc, market / limit / stop_limit
+                only. Its window is the config's "crypto" section, in UTC
+                (default 00:20 to 23:00, every day: the market never closes).
+                Daily limits still count by the New York date, for everything.
   short         selling more than you hold, unless "allow_short": true
 
 What blocks an entry (on top):
@@ -73,7 +79,7 @@ DEFAULTS = {
     "max_orders_per_day": 10, "min_reward_risk": 1.0, "require_stop": True,
     "no_entries_before": "09:45", "no_entries_after": "15:30", "flat_by": "15:55",
     "paper": True, "blocked": [], "allow_options": False, "allow_margin": False, "allow_short": False,
-    "pdt_guard": False,
+    "pdt_guard": False, "allow_crypto": False,
 }
 ALPACA_FIELDS = ("symbol", "side", "qty", "notional", "type", "time_in_force", "limit_price",
                  "stop_price", "trail_price", "trail_percent", "extended_hours", "client_order_id",
@@ -88,6 +94,10 @@ TICKER = re.compile(r"^[A-Z]{1,5}([.\-][A-Z]{1,2})?$")
 HHMM = re.compile(r"^([01]?\d|2[0-3]):([0-5]\d)$")
 CENT = 0.005
 FRESH_MINUTES = 15
+CRYPTO = re.compile(r"^[A-Z0-9]{2,10}-(USD|USDT|USDC|EUR|GBP)$")
+CRYPTO_WINDOW = {"no_entries_before": "00:20", "no_entries_after": "23:00"}  # UTC, every day
+CRYPTO_TYPES = {"market", "limit", "stop_limit"}
+CRYPTO_TIFS = {"gtc", "ioc"}
 REF_WORDS = {"plan": "the plan's entry", "price": "the latest price", "limit": "the limit price",
              "stop price": "the stop price", "stale price": "an old price"}
 
@@ -242,6 +252,27 @@ def window_check(now_et, c):
     return [], warns
 
 
+def is_crypto(sym):
+    return bool(CRYPTO.match(str(sym or "").strip().upper()))
+
+
+def crypto_window_check(now_utc, c):
+    """Reasons a crypto entry cannot be placed now. The market never closes: only the
+    config's "crypto" window counts, in UTC, every day of the year."""
+    w = dict(CRYPTO_WINDOW)
+    w.update({k: v for k, v in (c.get("crypto") or {}).items() if k in CRYPTO_WINDOW})
+    before = hhmm(w.get("no_entries_before"), "crypto.no_entries_before")
+    after = hhmm(w.get("no_entries_after"), "crypto.no_entries_after")
+    t = now_utc.time().replace(second=0, microsecond=0)
+    if before is not None and t < before:
+        return ["window: no new crypto entries before %s UTC (it is %s UTC)" % (before.strftime("%H:%M"),
+                                                                                 t.strftime("%H:%M"))]
+    if after is not None and t > after:
+        return ["window: no new crypto entries after %s UTC (it is %s UTC)" % (after.strftime("%H:%M"),
+                                                                                t.strftime("%H:%M"))]
+    return []
+
+
 def business_days(today, n=5):
     """The last n NYSE trading days up to and including today, newest first."""
     out, d = [], today
@@ -357,8 +388,8 @@ def day_trades(state, today):
         if rec.get("status") not in ("placed", "filled"):
             continue
         d = rec_day(rec)
-        if d not in days:
-            continue
+        if d not in days or is_crypto(rec.get("symbol")):
+            continue   # the pattern-day-trader rule is about stocks and options, not coins
         key = (d, str(rec.get("symbol", "")).upper())
         sides.setdefault(key, set()).add(str(rec.get("side", "")).lower())
         if d == today and rec.get("status") == "placed" and rec_is_entry(rec):
@@ -428,6 +459,7 @@ def check(orders, cfg, portfolio=None, prices=None, state=None, today=None, now=
         legs = o.get("take_profit_limit_price") is not None or o.get("stop_loss_stop_price") is not None
         bracket = oc == "bracket" or (not oc and legs)
         value = None
+        coin = is_crypto(sym)
 
         # format
         if not sym:
@@ -448,8 +480,9 @@ def check(orders, cfg, portfolio=None, prices=None, state=None, today=None, now=
             reasons.append("format: unknown order type %r" % typ)
         if tif not in TIFS:
             reasons.append("format: unknown time_in_force %r" % tif)
-        if notional is not None and (typ != "market" or tif != "day"):
-            reasons.append("format: a notional (dollar) order must be a market order with time_in_force day")
+        if notional is not None and (typ != "market" or tif != ("gtc" if coin else "day")):
+            reasons.append("format: a notional (dollar) order must be a market order with time_in_force %s"
+                           % ("gtc" if coin else "day"))
         if typ in ("limit", "stop_limit") and o.get("limit_price") is None:
             reasons.append("format: a %s order needs a limit_price" % typ)
         if typ in ("stop", "stop_limit") and o.get("stop_price") is None:
@@ -458,7 +491,18 @@ def check(orders, cfg, portfolio=None, prices=None, state=None, today=None, now=
             reasons.append("format: extended hours needs a limit order with time_in_force day or gtc")
         if o.get("stop_loss_limit_price") is not None and o.get("stop_loss_stop_price") is None:
             reasons.append("format: stop_loss_limit_price needs a stop_loss_stop_price")
-        if bracket:
+        if coin and c.get("allow_crypto"):
+            if bracket or oc:
+                reasons.append("crypto: Alpaca takes no bracket or OCO orders for crypto: buy alone, then "
+                               "protect it with a stop-limit sell once it fills (ticket.py protect)")
+            if typ not in CRYPTO_TYPES:
+                reasons.append("crypto: order type %r; crypto takes market, limit or stop_limit" % typ)
+            if tif not in CRYPTO_TIFS:
+                reasons.append("crypto: time_in_force %r; crypto takes gtc or ioc (the market never closes)"
+                               % tif)
+            if o.get("extended_hours"):
+                reasons.append("crypto: extended_hours means nothing for crypto: leave it out")
+        if bracket and not coin:
             if notional is not None:
                 reasons.append("format: a bracket order needs a whole-share qty, not a notional amount")
             elif _f(qty) is not None and abs(_f(qty) - round(_f(qty))) > 1e-9:
@@ -473,7 +517,14 @@ def check(orders, cfg, portfolio=None, prices=None, state=None, today=None, now=
                          % (oc or "advanced_instructions"))
 
         # asset
-        if sym and OCC.match(sym.replace(" ", "")):
+        if coin:
+            if not c.get("allow_crypto"):
+                reasons.append("asset: %s is crypto; crypto is off (\"allow_crypto\": false in "
+                               "trader/config.json)" % sym)
+            else:
+                warns.append("crypto: %s trades 24 hours a day, 7 days a week, and can gap through a stop "
+                             "while you sleep" % sym)
+        elif sym and OCC.match(sym.replace(" ", "")):
             if not c.get("allow_options"):
                 reasons.append("asset: %s is an option contract; options are off "
                                "(\"allow_options\": false)" % sym)
@@ -577,7 +628,11 @@ def check(orders, cfg, portfolio=None, prices=None, state=None, today=None, now=
             if leg_stop and plan_stop and abs(leg_stop - plan_stop) > CENT:
                 warns.append("the bracket stop %s differs from the plan's stop %s: the bracket's is the one "
                              "the broker uses" % (_p(leg_stop), _p(plan_stop)))
-            if stop and not leg_stop:
+            if stop and not leg_stop and coin:
+                warns.append("the stop %s is in the plan only: once the buy fills, place the stop-limit sell "
+                             "(trader-broker: ticket.py protect) and set the alerts (alerts.py add --from-plan)"
+                             % _p(stop))
+            elif stop and not leg_stop:
                 warns.append("the stop %s is in the plan only, not at the broker: set a stop alert "
                              "(trader-alerts: alerts.py add --from-plan)" % _p(stop))
             if not stop:
@@ -597,8 +652,10 @@ def check(orders, cfg, portfolio=None, prices=None, state=None, today=None, now=
                     max_loss = round(shares * risk_ps, 2)
                     cap = _f(c.get("max_loss_per_trade_usd"))
                     if cap and max_loss > cap + CENT:
-                        later.append("loss: %s shares x %s risk a share = %s at the stop, over your %s max loss "
-                                     "per trade" % (_num(shares), _p(risk_ps), money(max_loss), money(cap)))
+                        later.append("loss: %s %s x %s risk a %s = %s at the stop, over your %s max loss "
+                                     "per trade" % (_qty(shares) if coin else _num(shares),
+                                                    sym.split("-")[0] if coin else "shares", _p(risk_ps),
+                                                    "coin" if coin else "share", money(max_loss), money(cap)))
                     min_rr = _f(c.get("min_reward_risk"))
                     if target:
                         if (long and target <= ref + CENT) or (not long and target >= ref - CENT):
@@ -623,15 +680,15 @@ def check(orders, cfg, portfolio=None, prices=None, state=None, today=None, now=
             if cap_t and len(entries_today) + batch_entries >= cap_t:
                 later.append("trades: %d entries placed today plus %d passed earlier in this batch, your limit "
                              "is %d a day" % (len(entries_today), batch_entries, cap_t))
-            later.extend(win_reasons)
+            later.extend(crypto_window_check(now_utc, c) if coin else win_reasons)
             if c.get("pdt_guard") and pdt_n >= 3:
                 later.append("pdt: %d day trades in the last 5 business days (%s); a 4th trips the "
                              "pattern-day-trader rule your broker applies (\"pdt_guard\": true)"
                              % (pdt_n, ", ".join(pdt_list)))
             if stop and ref and risk_ps:
-                info.append("entry %s (%s), stop %s, target %s: risk %s a share"
+                info.append("entry %s (%s), stop %s, target %s: risk %s a %s"
                             % (_p(ref), REF_WORDS.get(ref_from, ref_from), _p(stop),
-                               _p(target) if target else "none", _p(risk_ps)))
+                               _p(target) if target else "none", _p(risk_ps), "coin" if coin else "share"))
                 info.append("max loss %s%s, reward:risk %s%s"
                             % (money(max_loss), (" (limit %s)" % money(c["max_loss_per_trade_usd"]))
                                if _f(c.get("max_loss_per_trade_usd")) else "",
@@ -683,7 +740,8 @@ def check(orders, cfg, portfolio=None, prices=None, state=None, today=None, now=
                     acct["shares"][sym] = held - value / ref
         results.append({
             "index": i, "symbol": sym, "side": side, "kind": kind,
-            "amount": money(_f(notional) or 0) if notional is not None else ("%s shares" % qty),
+            "amount": money(_f(notional) or 0) if notional is not None else
+                      ("%s %s" % (qty, sym.split("-")[0] if coin else "shares")),
             "value_usd": round(value, 2) if value is not None else None,
             "entry_ref": round(ref, 2) if ref else None, "entry_ref_from": ref_from,
             "stop": stop, "target": target, "risk_per_share": risk_ps, "max_loss": max_loss,
@@ -713,6 +771,11 @@ def _pct(x):
 def _num(x):
     x = float(x)
     return str(int(x)) if x == int(x) else ("%.4f" % x).rstrip("0")
+
+
+def _qty(x):
+    """A coin quantity, to the millionth: 0.055654."""
+    return ("%.6f" % float(x)).rstrip("0").rstrip(".")
 
 
 def report(res):
@@ -773,20 +836,24 @@ def main(argv=None):
                     help="your account; if missing, a fresh account funded with the budget")
     ap.add_argument("--prices", default="trader/prices.json")
     ap.add_argument("--state", default="trader/state/broker.json", help="what trader-broker placed today")
-    ap.add_argument("--now", help="pretend it is this New York time, e.g. \"2026-10-19 10:15\"")
+    ap.add_argument("--now", help="pretend it is this New York time, e.g. \"2026-10-19 10:15\" (UTC when "
+                                  "every order is crypto)")
     ap.add_argument("--today", help="YYYY-MM-DD (default: today in New York)")
     ap.add_argument("--out", default="trader/state/risk.json", help="where the verdicts are recorded")
     ap.add_argument("--no-write", action="store_true", help="do not record the verdicts")
     ap.add_argument("--json", action="store_true")
     a = ap.parse_args(argv)
     try:
-        now = parse_now(a.now)
         if a.today and not re.match(r"^\d{4}-\d{2}-\d{2}$", a.today):
             raise RiskError("--today wants a date like 2026-10-19")
         doc = read_json(a.orders, "orders file (run trader-budget first)")
         orders = doc.get("orders", doc) if isinstance(doc, dict) else doc
         if not isinstance(orders, list) or not orders:
             raise RiskError("no orders in %s" % a.orders)
+        all_coins = all(isinstance(o, dict) and is_crypto(o.get("symbol")) for o in orders)
+        if all_coins and a.now and not re.search(r"(Z|[+-]\d\d:?\d\d)$", a.now.strip()):
+            a.now = a.now.strip() + "Z"   # crypto reads UTC, like the rest of the pack in crypto mode
+        now = parse_now(a.now)
         cfg = read_json(a.config, "config", required=False) or {}
         portfolio = read_json(a.portfolio, "portfolio", required=False)
         pdoc = read_json(a.prices, "prices", required=False) or {}

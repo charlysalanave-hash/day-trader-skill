@@ -12,6 +12,9 @@ description: >-
   "what is breaking out", "opening range breakouts", "scan for bull flags",
   "oversold stocks", "pre-market scan", "build my watchlist", "what should I
   look at today", or at the start of a trading day before /trader-news.
+  Crypto pairs too (BTC-USD, ETH-USD): UTC days, every day, with the
+  opening range at midnight UTC. Also when the user says "scan bitcoin",
+  "scan BTC", "crypto setups".
 argument-hint: "[universe | daily | orb] [--at HH:MM]"
 ---
 
@@ -177,6 +180,30 @@ charts) tags BLK, CI, XOM and HD a 20-day breakout, CCL a bull flag, F, JPM
 and GE a reclaim of the 20-day average, and BAC, MS, RIVN and PLUG oversold,
 as the reel did. On closes it also tags KO (breakout), RCL (flag) and PNC (an
 oversold bounce).
+
+## Crypto (BTC-USD)
+
+```bash
+python3 "${CLAUDE_SKILL_DIR}/scan.py" daily --crypto                      # the 16 most traded pairs on Yahoo
+python3 "${CLAUDE_SKILL_DIR}/scan.py" daily --symbols BTC-USD,ETH-USD
+python3 "${CLAUDE_SKILL_DIR}/scan.py" orb --symbols BTC-USD --at 01:00     # UTC
+```
+
+Crypto mode turns on with `--crypto`, or when every symbol is a crypto pair in
+Yahoo's form (`BTC-USD`). Plain `BTC` is an ETF on NYSE Arca, not the coin:
+when the user says "BTC" or "bitcoin", scan `BTC-USD`. In crypto mode:
+
+- the day is 00:00 to 24:00 UTC, every day of the year, weekends and holidays too;
+- every time (`--now`, `--at`, the output) is UTC on a 24-hour clock;
+- the opening range is the first 15 minutes after midnight UTC (Yahoo's crypto day);
+- the price and volume floors default to 0;
+- the entry window comes from the config's `"crypto"` section (`no_entries_after` 23:00 UTC);
+- `trader/watchlist.json` carries `"market": "crypto"`, and the next tools follow it.
+
+Stocks and crypto never mix in one scan: their days and clocks differ.
+Midnight UTC is a convention, not an opening bell: there is no auction and no
+crowd arriving at once, so an opening-range breakout on a coin is a weaker
+signal than on a stock. Say so, and run the Time Machine before anything else.
 
 ## Rules
 

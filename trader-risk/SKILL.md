@@ -15,6 +15,7 @@ description: >-
   an order that passed. Use when the user says "check my order", "is this
   safe", "risk check", "does this break my rules", "can I take this trade",
   "how much have I risked today", or before /trader-broker, always.
+  Crypto pairs (BTC-USD) are blocked unless "allow_crypto": true.
 argument-hint: "[path to orders.json]"
 ---
 
@@ -146,6 +147,21 @@ The same 8 shares checked at 10:55 with the real 10:52 quote (366.48) in
 reward:risk 0.44. At 9:40 they are blocked by the window (no new entries
 before 9:45). The 3:55 PM sell that closes the position passes, even though
 it is after the 3:30 entry cutoff: it is an exit.
+
+## Crypto (BTC-USD)
+
+Crypto is off by default: a crypto pair is BLOCKED unless the config has
+`"allow_crypto": true`. With it on, a crypto order also needs: no bracket or
+OCO (Alpaca has none for coins), `time_in_force` `gtc` or `ioc`, and a type of
+market, limit or stop_limit. Its entry window is the config's `"crypto"`
+section in UTC (00:20 to 23:00 by default, every day: weekends and NYSE
+holidays do not close it). Every other check is the same: the stop, the max
+loss at the stop, reward:risk, the daily loss, trades a day, cash, size. The
+daily limits count by the New York date, for stocks and crypto together. The
+pattern-day-trader count leaves coins out. When every order in the file is
+crypto, `--now` is read as UTC. The protective stop-limit sell from
+`ticket.py protect` is an exit, so it is never blocked by the window or the
+day limits.
 
 ## Rules
 

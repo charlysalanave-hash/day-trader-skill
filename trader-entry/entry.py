@@ -103,6 +103,37 @@ OPEN = datetime.time(9, 30)
 CLOSE = datetime.time(16, 0)
 EARLY = datetime.time(13, 0)
 
+TZ = "ET"
+
+# Crypto pairs (Yahoo's BTC-USD) trade around the clock. In crypto mode the day
+# is 00:00 to 24:00 UTC, every day of the year, and every clock in this tool
+# reads UTC instead of New York (the config's "crypto" section sets the times).
+CRYPTO = re.compile(r"^[A-Z0-9]{2,10}-(USD|USDT|USDC|EUR|GBP)$")
+CRYPTO_WINDOW = {"no_entries_before": "00:20", "no_entries_after": "23:00", "flat_by": "23:55"}  # UTC
+MARKET = {"crypto": False}
+
+
+def is_crypto(sym):
+    return bool(CRYPTO.match(str(sym or "").strip().upper()))
+
+
+def use_market(crypto):
+    """Switch the whole tool to crypto time (UTC, every day, 24 hours) or back to the NYSE."""
+    global OPEN, CLOSE, TZ
+    MARKET["crypto"] = bool(crypto)
+    OPEN, CLOSE, TZ = ((datetime.time(0, 0), datetime.time(23, 59, 59), "UTC") if crypto
+                       else (datetime.time(9, 30), datetime.time(16, 0), "ET"))
+
+
+def crypto_config(cfg):
+    """In crypto mode the times come from the config's "crypto" section (UTC), never
+    from the New York keys: 09:45 ET means nothing to a market that never closes."""
+    if not MARKET["crypto"]:
+        return cfg
+    out = dict(cfg, **CRYPTO_WINDOW)
+    out.update(cfg.get("crypto") or {})
+    return out
+
 
 class EntryError(Exception):
     pass
@@ -119,7 +150,9 @@ def _nth_sunday(year, month, n):
 def eastern_offset(utc):
     """Hours from UTC for New York: -4 in daylight time, -5 otherwise.
     DST runs from 2:00 a.m. on the second Sunday of March to 2:00 a.m. on the
-    first Sunday of November (US rule since 2007)."""
+    first Sunday of November (US rule since 2007). 0 in crypto mode (UTC)."""
+    if MARKET["crypto"]:
+        return 0
     y = utc.year
     start = datetime.datetime.combine(_nth_sunday(y, 3, 2), datetime.time(7, 0))   # 2:00 EST
     end = datetime.datetime.combine(_nth_sunday(y, 11, 1), datetime.time(6, 0))    # 2:00 EDT
@@ -132,6 +165,8 @@ def to_eastern(utc):
 
 
 def eastern_to_utc(local):
+    if MARKET["crypto"]:
+        return local
     for off in (-4, -5):
         utc = local - datetime.timedelta(hours=off)
         if eastern_offset(utc) == off:
@@ -162,15 +197,16 @@ def parse_now(text):
     if not text:
         return utc_now()
     t = text.strip()
-    if t.upper().endswith(" ET"):
-        t = t[:-3].strip()
+    if t.upper().endswith((" ET", " UTC")):
+        t = t.rsplit(" ", 1)[0].strip()
     if re.match(r"^\d{1,2}:\d{2}$", t):
         t = "%s %s" % (to_eastern(utc_now()).date().isoformat(), t.zfill(5))
     t = t.replace("Z", "+00:00")
     try:
         dt = datetime.datetime.fromisoformat(t)
     except ValueError:
-        raise EntryError('--now wants a New York time like "2026-10-19 10:15" (or ...Z for UTC)')
+        raise EntryError('--now wants a %s time like "2026-10-19 10:15" (or ...Z for UTC)'
+                         % ("UTC" if MARKET["crypto"] else "New York"))
     if dt.tzinfo is None:
         return eastern_to_utc(dt)
     return (dt - dt.utcoffset()).replace(tzinfo=None)
@@ -194,12 +230,16 @@ def short(t):
 
 
 def ampm(t):
+    if MARKET["crypto"]:
+        return "%02d:%02d" % (t.hour, t.minute)   # UTC reads on a 24-hour clock
     h = t.hour % 12 or 12
     return "%d:%02d %s" % (h, t.minute, "AM" if t.hour < 12 else "PM")
 
 
 def trading_day(d):
-    """(is_trading_day, reason). Weekends and the NYSE holiday list."""
+    """(is_trading_day, reason). Weekends and the NYSE holiday list; crypto trades every day."""
+    if MARKET["crypto"]:
+        return True, ""
     if d.weekday() >= 5:
         return False, "weekend"
     name = NYSE_HOLIDAYS.get(d.isoformat())
@@ -209,10 +249,12 @@ def trading_day(d):
 
 
 def session(d):
-    """(open_time, close_time) in New York time, or None if closed all day."""
+    """(open_time, close_time) in New York time (UTC for crypto), or None if closed all day."""
     ok, _ = trading_day(d)
     if not ok:
         return None
+    if MARKET["crypto"]:
+        return OPEN, CLOSE
     return OPEN, (EARLY if d.isoformat() in NYSE_EARLY_CLOSE else CLOSE)
 
 
@@ -385,6 +427,11 @@ def read_config(path):
         for k in DEFAULTS:
             if doc.get(k):
                 cfg[k] = doc[k]
+        if MARKET["crypto"]:
+            cfg = crypto_config(dict(cfg, crypto=doc.get("crypto")))
+    elif MARKET["crypto"]:
+        cfg = crypto_config(cfg)
+    cfg = {k: cfg[k] for k in DEFAULTS}
     for k in DEFAULTS:
         parse_hhmm(cfg[k], k)
     return cfg
@@ -425,7 +472,9 @@ def evaluate(chart, now_utc, setup="orb", or_minutes=15, interval="5m", level=No
            "interval": interval, "or_minutes": or_minutes, "now": local.strftime("%Y-%m-%d %H:%M:%S"), "status": "waiting",
            "phase": "", "reason": "", "opening_range": None, "level": None, "trigger": None,
            "last": None, "forming": None, "min_volume_x": min_volume_x,
-           "prev_close": chart.get("prev_close"), "calendar_known": day.year in CALENDAR_YEARS, "_bars": []}
+           "prev_close": chart.get("prev_close"), "_bars": [],
+           "calendar_known": MARKET["crypto"] or day.year in CALENDAR_YEARS,
+           "market": "crypto" if MARKET["crypto"] else "stocks", "tz": TZ}
     dt = chart.get("data_time")
     res["data_time"] = to_eastern(utc_of(dt)).strftime("%Y-%m-%d %H:%M:%S") if dt else None
     ok, why = trading_day(day)
@@ -562,7 +611,7 @@ def entry_doc(res, now_utc):
     t = res.get("trigger") or {}
     orr = res.get("opening_range")
     return {"created_by": "trader-entry", "symbol": res["symbol"], "setup": res["setup"], "side": "buy",
-            "date": res["date"], "status": res["status"], "time": t.get("time"), "bar_start": t.get("bar_start"),
+            "market": res.get("market", "stocks"), "date": res["date"], "status": res["status"], "time": t.get("time"), "bar_start": t.get("bar_start"),
             "bar_index": t.get("bar_index"), "price": t.get("price"), "level": res.get("level"),
             "interval": res["interval"],
             "opening_range": {"high": orr["high"], "low": orr["low"], "minutes": orr["minutes"]} if orr else None,
@@ -595,8 +644,8 @@ def describe(res):
     """Plain lines for a person."""
     when = datetime.datetime.strptime(res["now"], "%Y-%m-%d %H:%M:%S")
     bars = "5-minute" if res["interval"] == "5m" else "1-minute"
-    head = "%s  %s %s ET  %s on %s bars (Yahoo, free, can lag)" % (
-        res["symbol"], when.strftime("%a %Y-%m-%d"), when.strftime("%H:%M"), setup_name(res), bars)
+    head = "%s  %s %s %s  %s on %s bars (Yahoo, free, can lag)" % (
+        res["symbol"], when.strftime("%a %Y-%m-%d"), when.strftime("%H:%M"), res.get("tz", "ET"), setup_name(res), bars)
     if res.get("data_time") and res["data_time"] <= res["now"] and res["data_time"][:10] == res["date"]:
         head += ", data to %s" % res["data_time"][11:]
     out = [head]
@@ -715,8 +764,8 @@ def watch_loop(provider, clock, sleep, emit, opts, every=30, until=None, max_err
         close_dt = datetime.datetime.combine(day, s[1])
         if local < open_dt + datetime.timedelta(seconds=step):
             if not said_preopen:
-                emit("%s ET  %s: watching from the first bar's close at %s." % (
-                    local.strftime("%H:%M"), "not open yet" if local < open_dt else "open, no bar closed yet",
+                emit("%s %s  %s: watching from the first bar's close at %s." % (
+                    local.strftime("%H:%M"), TZ, "not open yet" if local < open_dt else "open, no bar closed yet",
                     short(open_dt + datetime.timedelta(seconds=step))))
                 said_preopen = True
             next_fetch = eastern_to_utc(open_dt) + datetime.timedelta(seconds=step + GRACE)
@@ -726,7 +775,7 @@ def watch_loop(provider, clock, sleep, emit, opts, every=30, until=None, max_err
             errors = 0
         except EntryError as e:
             errors += 1
-            emit("%s ET  could not read bars: %s" % (local.strftime("%H:%M:%S"), e))
+            emit("%s %s  could not read bars: %s" % (local.strftime("%H:%M:%S"), TZ, e))
             if errors >= max_errors:
                 emit("Stopping after %d failed reads in a row." % errors)
                 return 1, None
@@ -802,6 +851,19 @@ def _load(a, sym, now):
         return ch, (utc_of(ch["data_time"]) if ch.get("data_time") else utc_now())
     now = now or utc_now()
     return get_chart(sym, a.interval, to_eastern(now).date(), a.offline, real_today), now
+
+
+def pick_market(a):
+    """Crypto mode for a crypto pair (BTC-USD), or a watchlist the scanner wrote in crypto mode."""
+    crypto = is_crypto(getattr(a, "symbol", ""))
+    if a.cmd == "watchlist" and os.path.exists(a.watchlist):
+        try:
+            with open(a.watchlist, encoding="utf-8") as fh:
+                doc = json.load(fh)
+        except ValueError:
+            doc = {}
+        crypto = isinstance(doc, dict) and doc.get("market") == "crypto"
+    use_market(crypto)
 
 
 def cmd_check(a):
@@ -922,7 +984,7 @@ def main(argv=None):
         p.add_argument("--level", type=float, help="the price to close above (--setup level)")
         p.add_argument("--min-volume-x", type=float, help="trigger bar volume vs the range bars' average")
         p.add_argument("--side", default="buy", choices=["buy", "long", "sell", "short"], help="v2: buy only")
-        p.add_argument("--now", help='pretend it is this New York time, e.g. "2026-10-19 10:15"')
+        p.add_argument("--now", help='pretend it is this New York time (UTC for crypto), e.g. "2026-10-19 10:15"')
         p.add_argument("--offline", metavar="PATH", help="saved Yahoo chart JSON (.json/.json.gz) or a folder")
         p.add_argument("--config", default="trader/config.json")
 
@@ -936,7 +998,7 @@ def main(argv=None):
     p.add_argument("symbol")
     common(p)
     p.add_argument("--every", type=float, default=30, help="seconds between polls while Yahoo is behind")
-    p.add_argument("--until", help="stop at this New York time (HH:MM)")
+    p.add_argument("--until", help="stop at this New York time (UTC for crypto), HH:MM")
     p.add_argument("--out", default="trader/entry.json", help="where a trigger is written")
     p = sub.add_parser("watchlist", help="check every hit in trader/watchlist.json")
     common(p)
@@ -947,6 +1009,7 @@ def main(argv=None):
         ap.print_help()
         return 1
     try:
+        pick_market(a)
         return {"check": cmd_check, "watch": cmd_watch, "watchlist": cmd_watchlist}[a.cmd](a)
     except EntryError as e:
         print("entry.py: %s" % e, file=sys.stderr)

@@ -13,6 +13,7 @@ description: >-
   carlo", "backtest this setup", "how often does this hit the target", "is
   this a coin flip", or after /trader-exit writes a plan, before
   /trader-budget.
+  Crypto pairs too (BTC-USD): 288 five-minute bars per UTC day.
 argument-hint: "[path to plan.json, or TICKER]"
 ---
 
@@ -136,6 +137,17 @@ At 1R the target has to come first in half of the replays that hit one
 side. It did in 53.6 %. The replays came out close to a coin flip, and the
 real history was slightly worse than even. That is the honest answer for this setup, and it is what
 the user should hear before `/trader-budget` sizes 8 shares.
+
+## Crypto (BTC-USD)
+
+A plan for a crypto pair runs on UTC days: 288 five-minute bars from midnight
+to midnight, every day, from Yahoo's last 60 days. A day missing up to 6 bars
+in a row (30 minutes nobody traded on Yahoo) is kept, those bars filled flat
+at the last close; a longer gap leaves the day out and says so. Times are UTC
+on a 24-hour clock (`"01:25"` is 1:25 a.m.). Each replay runs to midnight UTC
+unless you pass `--until 23:55` (the crypto flat-by). The fan chart shows one
+column per 15 minutes so it fits on a screen. Crypto can gap through a stop
+in a way the last 60 days never did: the odds are a reality check, not a promise.
 
 ## Rules
 

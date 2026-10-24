@@ -13,6 +13,7 @@ description: >-
   "watch my stop", "watch my trade", "remind me to close by 3:55", "is the
   market open", "when does the market open", "get me a price", or right
   after /trader-exit writes a plan.
+  Crypto pairs too (BTC-USD): rules on the UTC clock, every day.
 argument-hint: "[ticker] [price]"
 ---
 
@@ -136,6 +137,17 @@ open, close it: trader-broker flatten --symbol TSLA builds the sell ticket, then
 
 It rings once. The next morning the plan's three alerts are no longer
 watched; with `add --opening-bell`, the bell rings at 9:30.
+
+## Crypto (BTC-USD)
+
+`alerts.py add --from-plan` on a crypto plan writes the stop, the target and
+a "flat by" time alert (23:55 UTC by default) with `"tz": "UTC"`: they read
+the UTC clock and the UTC date and ring every day, weekends too. A rule added
+by hand for a crypto pair gets `"tz": "UTC"` as well. Quotes come from Yahoo
+(`alerts.py quote BTC-USD --write`). The NYSE clock still prints, but it does
+not gate crypto. There is no bracket at the broker for crypto: the target is
+only this alert, and the stop at the broker is the stop-limit from
+`ticket.py protect`.
 
 ## Rules
 

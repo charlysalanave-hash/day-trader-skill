@@ -25,6 +25,7 @@ CONTRACT_CFG = {
     "no_entries_before": "09:45", "no_entries_after": "15:30", "flat_by": "15:55",
     "fractional": False, "broker": "alpaca", "paper": True, "blocked": [],
     "allow_options": False, "allow_margin": False, "allow_short": False, "pdt_guard": False,
+    "allow_crypto": False, "crypto": {"no_entries_before": "00:20", "no_entries_after": "23:00", "flat_by": "23:55"},
     "sec_user_agent": "Your Name you@example.com",
 }
 # v1's rules, for the weights mode tests

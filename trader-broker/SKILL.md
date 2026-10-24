@@ -14,6 +14,8 @@ description: >-
   says "place the order", "buy it", "execute", "send it to my broker",
   "close my position", "flatten", "get me out", "connect Alpaca", "set up
   paper trading", or after /trader-risk passes.
+  Crypto pairs (BTC-USD) go to place_crypto_order (BTC/USD, no bracket),
+  then "ticket.py protect" builds the stop-limit sell after the fill.
 argument-hint: "[order number]"
 ---
 
@@ -190,6 +192,36 @@ The user replies "yes". Claude records it, calls `place_stock_order`, and the
 card reads "Claude wants to use Place stock order" with that JSON and two
 buttons: Allow once, Deny. Allow once sends it to the paper account. The
 `why` and the plan stay in the file; they are never sent.
+
+## Crypto (BTC-USD)
+
+Only when the user has turned crypto on (`"allow_crypto": true`) and
+trader-risk passed the order. A crypto ticket goes to Alpaca's
+`place_crypto_order`, not `place_stock_order`: the pair is written `BTC/USD`
+and the type is sent as `order_type`. The ticket prints the exact JSON; check
+it against the tool's parameters in Claude's card before Allow once, and if
+the server names a parameter differently, stop and tell the user rather than
+guess. In the Alpaca setup, `place_crypto_order` ships **Blocked**: the user
+switches it to **Needs approval** (never Always allow) only if they want
+crypto.
+
+Alpaca has no bracket orders for crypto, so the stop comes in a second step:
+
+1. The buy: `ticket.py show`, the user's yes, `place_crypto_order`, then
+   `ticket.py result --index N --status placed --filled-qty Q --filled-price P`.
+2. Right away: `ticket.py protect --symbol BTC-USD` writes a stop-limit sell
+   for what is held, at the plan's stop, limit 0.5 % under it, good until
+   canceled. Then `/trader-risk` (an exit, never blocked by the window),
+   `ticket.py show`, the user's yes, `place_crypto_order`, `result`.
+3. The target is an alert (`alerts.py add --from-plan`). At the target or at
+   the flat-by (23:55 UTC): cancel the protective stop first (Alpaca holds the
+   coins for it: `get_orders`, `cancel_order_by_id`, Needs approval), then
+   `ticket.py flatten --symbol BTC-USD` (a market sell, gtc), trader-risk, the
+   user's yes.
+
+Until step 2 is placed, nothing at the broker limits the loss: say so. A
+stop-limit only sells at its limit or better; in a crash it can skip past it
+and not fill at all. Crypto trades all night and all weekend.
 
 ## What it never does
 

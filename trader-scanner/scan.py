@@ -124,6 +124,30 @@ CALENDAR_YEARS = (2026, 2027)
 OPEN = datetime.time(9, 30)
 CLOSE = datetime.time(16, 0)
 EARLY = datetime.time(13, 0)
+TZ = "ET"
+
+# Crypto pairs (Yahoo's BTC-USD) trade around the clock. In crypto mode the day
+# is 00:00 to 24:00 UTC, every day of the year, every clock in this tool reads
+# UTC, and the opening range starts at midnight UTC (Yahoo's crypto day).
+CRYPTO = re.compile(r"^[A-Z0-9]{2,10}-(USD|USDT|USDC|EUR|GBP)$")
+CRYPTO_OPEN = datetime.time(0, 0)
+CRYPTO_CLOSE = datetime.time(23, 59, 59)   # the day's last second: the 23:55 bar closes at midnight
+CRYPTO_UNIVERSE = ["BTC-USD", "ETH-USD", "SOL-USD", "XRP-USD", "BNB-USD", "DOGE-USD", "ADA-USD", "TRX-USD",
+                   "AVAX-USD", "LINK-USD", "DOT-USD", "LTC-USD", "BCH-USD", "XLM-USD", "SHIB-USD", "UNI-USD"]
+CRYPTO_WINDOW = {"no_entries_before": "00:20", "no_entries_after": "23:00", "flat_by": "23:55"}  # UTC
+MARKET = {"crypto": False}
+
+
+def is_crypto(sym):
+    return bool(CRYPTO.match(str(sym or "").strip().upper()))
+
+
+def use_market(crypto):
+    """Switch the whole tool to crypto time (UTC, every day, 24 hours) or back to the NYSE."""
+    global OPEN, CLOSE, TZ
+    MARKET["crypto"] = bool(crypto)
+    OPEN, CLOSE, TZ = (CRYPTO_OPEN, CRYPTO_CLOSE, "UTC") if crypto else (datetime.time(9, 30),
+                                                                     datetime.time(16, 0), "ET")
 
 SETUPS = [
     ("breakout_20d", "20-day closing-high breakout"),
@@ -150,7 +174,9 @@ def _nth_sunday(year, month, n):
 def eastern_offset(utc):
     """Hours from UTC for New York: -4 in daylight time, -5 otherwise.
     DST runs from 2:00 a.m. on the second Sunday of March to 2:00 a.m. on the
-    first Sunday of November (US rule since 2007)."""
+    first Sunday of November (US rule since 2007). 0 in crypto mode (UTC)."""
+    if MARKET["crypto"]:
+        return 0
     y = utc.year
     start = datetime.datetime.combine(_nth_sunday(y, 3, 2), datetime.time(7, 0))   # 2:00 EST
     end = datetime.datetime.combine(_nth_sunday(y, 11, 1), datetime.time(6, 0))    # 2:00 EDT
@@ -163,6 +189,8 @@ def to_eastern(utc):
 
 
 def eastern_to_utc(local):
+    if MARKET["crypto"]:
+        return local
     for off in (-4, -5):
         utc = local - datetime.timedelta(hours=off)
         if eastern_offset(utc) == off:
@@ -192,12 +220,14 @@ def parse_now(text):
 def parse_hhmm(text, flag="--at"):
     m = re.match(r"^\s*(\d{1,2}):(\d{2})\s*$", text or "")
     if not m or int(m.group(1)) > 23 or int(m.group(2)) > 59:
-        raise ScanError("%s wants a New York time like 10:15" % flag)
+        raise ScanError("%s wants a %s time like 10:15" % (flag, "UTC" if MARKET["crypto"] else "New York"))
     return datetime.time(int(m.group(1)), int(m.group(2)))
 
 
 def trading_day(d):
-    """(is_trading_day, reason). Weekends and the NYSE holiday list."""
+    """(is_trading_day, reason). Weekends and the NYSE holiday list; crypto trades every day."""
+    if MARKET["crypto"]:
+        return True, ""
     if d.weekday() >= 5:
         return False, "weekend"
     name = NYSE_HOLIDAYS.get(d.isoformat())
@@ -207,15 +237,19 @@ def trading_day(d):
 
 
 def session(d):
-    """(open_time, close_time) in New York time, or None if closed all day."""
+    """(open_time, close_time) in New York time (UTC for crypto), or None if closed all day."""
     ok, _ = trading_day(d)
     if not ok:
         return None
+    if MARKET["crypto"]:
+        return OPEN, CLOSE
     return OPEN, (EARLY if d.isoformat() in NYSE_EARLY_CLOSE else CLOSE)
 
 
 def clock_label(t):
-    """datetime or time -> '10:15 AM'."""
+    """datetime or time -> '10:15 AM' ('00:25' in crypto mode: UTC reads on a 24-hour clock)."""
+    if MARKET["crypto"]:
+        return "%02d:%02d" % (t.hour, t.minute)
     h = t.hour % 12 or 12
     return "%d:%02d %s" % (h, t.minute, "AM" if t.hour < 12 else "PM")
 
@@ -271,6 +305,12 @@ def to_yahoo(sym):
     return sym.upper().replace(".", "-")
 
 
+def from_yahoo(ysym):
+    """BRK-B -> BRK.B, but a crypto pair keeps its dash (BTC-USD)."""
+    ysym = ysym.upper()
+    return ysym if is_crypto(ysym) else ysym.replace("-", ".")
+
+
 def spark_path(symbols, rng, interval):
     return "/v7/finance/spark?symbols=%s&range=%s&interval=%s" % (
         ",".join(to_yahoo(s) for s in symbols), rng, interval)
@@ -309,7 +349,7 @@ def parse_spark(text_or_doc, wanted=None):
         if not resp:
             continue
         ysym = item.get("symbol") or (resp[0].get("meta") or {}).get("symbol") or ""
-        sym = (wanted or {}).get(ysym.upper(), ysym.upper().replace("-", "."))
+        sym = (wanted or {}).get(ysym.upper(), from_yahoo(ysym))
         out[sym] = series_from_result(resp[0])
     if err and not out:
         raise ScanError("Yahoo spark: %s" % (err.get("description") or err.get("code") or err))
@@ -356,7 +396,7 @@ def _absorb(doc, name_hint, data, errors):
                 sym = (doc["chart"].get("result") or [{}])[0]["meta"]["symbol"]
             except (AttributeError, KeyError, TypeError, IndexError):
                 raise ScanError("an offline v8 chart without a symbol: name the file <TICKER>.json")
-        sym = sym.upper().replace("-", ".")
+        sym = from_yahoo(sym)
         try:
             data[sym] = parse_chart(doc, sym)
         except ScanError as e:
@@ -661,25 +701,25 @@ def orb_window(now_utc, at, or_minutes, until, explicit_day=None):
     if at is not None:
         cutoff = datetime.datetime.combine(day, at)
         if explicit_day is None and cutoff > now + datetime.timedelta(seconds=59):
-            raise ScanError("--at %s is later than now (%s ET)." % (at.strftime("%H:%M"), clock_label(now)))
+            raise ScanError("--at %s is later than now (%s %s)." % (at.strftime("%H:%M"), clock_label(now), TZ))
         if cutoff > close_dt:
             raise ScanError("--at %s is after the %s close on %s." % (at.strftime("%H:%M"), clock_label(close_dt),
                                                                        day_label(day)))
     else:
         cutoff = now.replace(second=0, microsecond=0)
         if cutoff >= close_dt:
-            raise ScanError("The market closed at %s ET on %s. Replay the session with --at 10:15."
-                            % (clock_label(close_dt), day_label(day)))
+            raise ScanError("The market closed at %s %s on %s. Replay the session with --at 10:15."
+                            % (clock_label(close_dt), TZ, day_label(day)))
     if cutoff < first_close:
-        raise ScanError("It is %s ET: the %d-minute opening range runs 9:30 to %s and the first bar after it "
+        raise ScanError("It is %s %s: the %d-minute opening range runs %s to %s and the first bar after it "
                         "closes at %s. Run orb again after %s."
-                        % (clock_label(cutoff), or_minutes, clock_label(range_end), clock_label(first_close),
-                           clock_label(first_close)))
+                        % (clock_label(cutoff), TZ, or_minutes, clock_label(slot(day, 0)), clock_label(range_end),
+                           clock_label(first_close), clock_label(first_close)))
     if until is not None and cutoff.time() > until:
-        raise ScanError("It is %s ET, after %s, your last time for new entries (no_entries_after): an "
+        raise ScanError("It is %s %s, after %s, your last time for new entries (no_entries_after): an "
                         "opening-range breakout found now is expired. Run orb tomorrow after %s, or replay "
-                        "today with --at 10:15." % (clock_label(cutoff), until.strftime("%H:%M"),
-                                                      clock_label(first_close)))
+                        "today with --at %s." % (clock_label(cutoff), TZ, until.strftime("%H:%M"),
+                                                   clock_label(first_close), "01:00" if MARKET["crypto"] else "10:15"))
     return day, cutoff
 
 
@@ -775,6 +815,8 @@ def read_symbols(a, offline_syms=None):
         syms = symbols_from_file(a.watchlist)
     elif offline_syms is not None and not a.universe:
         syms = sorted(offline_syms)  # offline: every chart in the file, unless a list was given
+    elif MARKET["crypto"] and not a.universe:
+        syms = list(CRYPTO_UNIVERSE)  # the most traded pairs on Yahoo; --symbols for others
     else:
         path = a.universe or DEFAULT_UNIVERSE
         if not os.path.exists(path):
@@ -819,7 +861,17 @@ def read_config(path):
             cfg = json.load(fh)
     except ValueError as e:
         raise ScanError("%s is not valid JSON: %s" % (path, e))
-    return cfg if isinstance(cfg, dict) else {}
+    return crypto_config(cfg if isinstance(cfg, dict) else {})
+
+
+def crypto_config(cfg):
+    """In crypto mode the times come from the config's "crypto" section (UTC), never
+    from the New York keys: 09:45 ET means nothing to a market that never closes."""
+    if not MARKET["crypto"]:
+        return cfg
+    out = dict(cfg, **CRYPTO_WINDOW)
+    out.update(cfg.get("crypto") or {})
+    return out
 
 
 def write_json(path, doc):
@@ -880,13 +932,40 @@ def cmd_universe(a):
     return 0 if kept else 1
 
 
+def pick_market(a, offline_syms=None):
+    """Crypto mode with --crypto, or when every symbol asked for is a crypto pair (BTC-USD).
+    Stocks and crypto never mix in one scan: their days and clocks differ. Then the
+    price and volume floors default to the market's own."""
+    if a.symbols:
+        syms = [s for s in re.split(r"[,\s]+", a.symbols.upper()) if s]
+    elif a.watchlist:
+        syms = symbols_from_file(a.watchlist)
+    else:
+        syms = list(offline_syms or [])
+    flags = [is_crypto(s) for s in syms]
+    crypto = bool(a.crypto or (flags and all(flags)))
+    if crypto and not all(flags):
+        raise ScanError("crypto mode scans crypto pairs only (BTC-USD), not %s"
+                        % ", ".join(s for s, f in zip(syms, flags) if not f)[:200])
+    if not crypto and any(flags):
+        raise ScanError("%s %s a crypto pair: scan crypto on its own (--symbols BTC-USD,ETH-USD or --crypto)"
+                        % (", ".join(s for s, f in zip(syms, flags) if f)[:200], "is" if sum(flags) == 1 else "are"))
+    use_market(crypto)
+    if a.min_price is None:
+        a.min_price = 0.0 if crypto else 5.0
+    if a.min_volume is None:
+        a.min_volume = 0 if crypto or a.cmd == "orb" else 1000000
+    return crypto
+
+
 def cmd_daily(a):
     t0 = time.time()
-    now = parse_now(a.now)
     offline_syms = None
     if a.offline:
         data, failed = load_offline(a.offline)
         offline_syms = sorted(set(data) | set(failed))
+    pick_market(a, offline_syms)
+    now = parse_now(a.now)
     symbols = read_symbols(a, offline_syms)
     if not a.offline:
         progress(a, "Fetching daily closes for %s symbols (%d spark requests)..."
@@ -896,7 +975,7 @@ def cmd_daily(a):
     nfailed = len(symbols) - counts["fetched"]
     as_of = ("%s close" % last_date.isoformat()) if last_date else None
     doc = {"created_by": "trader-scanner", "created_at": now.strftime("%Y-%m-%dT%H:%M:%SZ"), "mode": "daily",
-           "as_of": as_of, "universe": len(symbols), "scanned": counts["scanned"], "failed": nfailed,
+           "market": "crypto" if MARKET["crypto"] else "stocks", "as_of": as_of, "universe": len(symbols), "scanned": counts["scanned"], "failed": nfailed,
            "source": "yahoo", "filters": {"min_price": a.min_price, "min_volume": a.min_volume},
            "note": NOTE, "hits": hits}
     if a.offline:
@@ -907,8 +986,9 @@ def cmd_daily(a):
         print(json.dumps(dict(doc, counts=counts, seconds=round(time.time() - t0, 1)), indent=2))
         return 0 if hits else 1
     local = to_eastern(now)
-    print("Daily scan, %s ET, closes through %s (Yahoo spark, daily closes only)." % (
-        local.strftime("%a %Y-%m-%d %H:%M"), last_date.isoformat() if last_date else "nothing"))
+    print("Daily scan%s, %s %s, closes through %s (Yahoo spark, daily closes only%s)." % (
+        " (crypto)" if MARKET["crypto"] else "", local.strftime("%a %Y-%m-%d %H:%M"), TZ,
+        last_date.isoformat() if last_date else "nothing", ", UTC days" if MARKET["crypto"] else ""))
     print("Fetched %s of %s charts%s. %s passed the liquidity filter ($%s+ and %s+ shares)%s; "
           "%s scanned." % ("{:,}".format(counts["fetched"]), "{:,}".format(len(symbols)),
                            (" (%s failed or had no data)" % "{:,}".format(nfailed)) if nfailed else "",
@@ -941,16 +1021,18 @@ def _n(x):
 
 def cmd_orb(a):
     t0 = time.time()
-    now = parse_now(a.now)
-    at = parse_hhmm(a.at) if a.at else None
-    cfg = read_config(a.config)
-    until = parse_hhmm(a.until or cfg.get("no_entries_after") or "15:30", "--until")
     data = failed = None
     explicit_day = None
     offline_syms = None
     if a.offline:
         data, failed = load_offline(a.offline)
         offline_syms = sorted(set(data) | set(failed))
+    pick_market(a, offline_syms)
+    now = parse_now(a.now)
+    at = parse_hhmm(a.at) if a.at else None
+    cfg = read_config(a.config)
+    until = parse_hhmm(a.until or cfg.get("no_entries_after") or "15:30", "--until")
+    if a.offline:
         if not a.now:
             days = [ts_to_eastern(s["t"][-1]).date() for s in data.values() if s["t"]]
             if days:
@@ -982,9 +1064,9 @@ def cmd_orb(a):
     failed = dict(failed or {})
     failed.update(failed2)
     nfailed = len([s for s in symbols if s in failed])
-    as_of = "%s %s ET" % (day.isoformat(), cutoff.strftime("%H:%M"))
+    as_of = "%s %s %s" % (day.isoformat(), cutoff.strftime("%H:%M"), TZ)
     doc = {"created_by": "trader-scanner", "created_at": now.strftime("%Y-%m-%dT%H:%M:%SZ"), "mode": "orb",
-           "as_of": as_of, "universe": len(symbols), "scanned": counts["scanned"], "failed": nfailed,
+           "market": "crypto" if MARKET["crypto"] else "stocks", "as_of": as_of, "universe": len(symbols), "scanned": counts["scanned"], "failed": nfailed,
            "unconfirmed": counts["unconfirmed"], "source": "yahoo", "or_minutes": a.or_minutes,
            "interval": "%dm" % BAR_MIN,
            "filters": {"min_price": a.min_price, "min_volume": a.min_volume}, "note": NOTE, "hits": hits}
@@ -995,8 +1077,9 @@ def cmd_orb(a):
     if a.json:
         print(json.dumps(dict(doc, counts=counts, seconds=round(time.time() - t0, 1)), indent=2))
         return 0 if hits else 1
-    print("Opening-range breakout scan, %s %s ET: %d-minute range (9:30 to %s), 5-minute bars, Yahoo."
-          % (day_label(day), clock_label(cutoff), a.or_minutes, clock_label(slot(day, a.or_minutes // BAR_MIN))))
+    print("Opening-range breakout scan%s, %s %s %s: %d-minute range (%s to %s), 5-minute bars, Yahoo."
+          % (" (crypto)" if MARKET["crypto"] else "", day_label(day), clock_label(cutoff), TZ, a.or_minutes,
+             clock_label(slot(day, 0)), clock_label(slot(day, a.or_minutes // BAR_MIN))))
     print("Fetched %s of %s charts%s; %s usable%s; %s candidates, %s confirmed with real highs and lows."
           % ("{:,}".format(counts["fetched"]), "{:,}".format(len(symbols)),
              (" (%s failed or had no data)" % "{:,}".format(nfailed)) if nfailed else "",
@@ -1044,10 +1127,16 @@ def main(argv=None):
         g.add_argument("--watchlist", metavar="FILE", help="a watchlist.json (hits) or a text file of tickers")
         p.add_argument("--universe", help="symbol list, one SYMBOL|Name a line (default %s)" % DEFAULT_UNIVERSE)
         p.add_argument("--limit", type=int, help="scan only the first N symbols")
-        p.add_argument("--min-price", type=float, default=min_price)
-        p.add_argument("--min-volume", type=int, default=min_volume)
+        p.add_argument("--min-price", type=float, default=None,
+                       help="last price floor (%s; 0 for crypto)" % _n(min_price))
+        p.add_argument("--min-volume", type=int, default=None,
+                       help="volume floor (%s; 0 for crypto)" % "{:,}".format(min_volume))
+        p.add_argument("--crypto", action="store_true",
+                       help="crypto pairs (BTC-USD): UTC days, every day, 24 hours; without --symbols "
+                            "it scans the %d most traded pairs" % len(CRYPTO_UNIVERSE))
         p.add_argument("--offline", metavar="PATH", help="fixture folder or file instead of the network")
-        p.add_argument("--now", help='pretend it is this time ("2026-10-19 10:15" New York, or ...Z)')
+        p.add_argument("--now", help='pretend it is this time ("2026-10-19 10:15" New York, UTC for crypto, '
+                                     'or ...Z)')
         p.add_argument("--out", default="trader/watchlist.json")
         p.add_argument("--no-write", action="store_true")
         p.add_argument("--pause", type=float, default=PAUSE, help="seconds between requests (%.1f)" % PAUSE)
@@ -1062,7 +1151,7 @@ def main(argv=None):
     p.add_argument("--or-minutes", type=int, default=15)
     p.add_argument("--max-confirm", type=int, default=MAX_CONFIRM,
                    help="v8 charts to fetch in stage 2, most traded first (%d; 0 = all)" % MAX_CONFIRM)
-    p.add_argument("--at", help="cut the clock at this New York time, HH:MM")
+    p.add_argument("--at", help="cut the clock at this New York time (UTC for crypto), HH:MM")
     p.add_argument("--until", help="no new entries after HH:MM (default: config no_entries_after, 15:30)")
     p.add_argument("--config", default="trader/config.json")
     a = ap.parse_args(argv)

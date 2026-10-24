@@ -120,6 +120,37 @@ An example, the trade in the reel: Tesla, Monday October 19 2026, real data.
 9. **`/trader-alerts`** rings on the stop, the target and at 3:55 PM to
    flatten whatever is still open.
 
+## Crypto (BTC-USD)
+
+The same chain works on crypto pairs in Yahoo's form (`BTC-USD`, `ETH-USD`;
+plain `BTC` is an ETF, not the coin). Crypto never closes, so in crypto mode
+the day is 00:00 to 24:00 UTC, every day, every time is UTC, and the opening
+range is the first 15 minutes after midnight UTC. The window and the flat-by
+come from the config's `"crypto"` section (no entries before 00:20 or after
+23:00, flat by 23:55, all UTC).
+
+```bash
+python3 trader-scanner/scan.py daily --crypto                          # the main pairs, daily closes
+python3 trader-scanner/scan.py orb --symbols BTC-USD,ETH-USD           # midnight-UTC range breakouts
+python3 trader-entry/entry.py check BTC-USD --write                    # then exit, timemachine, budget
+python3 trader-broker/ticket.py protect --symbol BTC-USD               # the stop, after the buy fills
+```
+
+What changes on the way to an order:
+
+- **Off by default.** `/trader-risk` blocks crypto unless your config says
+  `"allow_crypto": true`.
+- **Fractional coins.** `/trader-budget` sizes in millionths of a coin, under
+  the same max loss, position cap and cash limits.
+- **No bracket.** Alpaca takes no bracket orders for crypto, so the buy goes
+  alone (`place_crypto_order`, `BTC/USD`, good until canceled). Once it
+  fills, `ticket.py protect` writes the stop-limit sell at the plan's stop,
+  through trader-risk and your yes like any order. The target is an alert.
+  Until that stop is placed, nothing at the broker limits the loss, and a
+  stop-limit can skip past its limit in a crash.
+- **24/7.** A coin can gap through your stop at 3 a.m. on a Sunday. The
+  midnight-UTC opening range is a convention, not an opening bell.
+
 ## The tools
 
 All standard-library Python. The data tools read public endpoints and are

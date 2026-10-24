@@ -19,6 +19,9 @@ work around the one moment that matters, your yes:
   fill      records a fill in trader/portfolio.json (cash and shares).
   flatten   builds a sell ticket that closes a symbol's open position by
             flat_by. It still goes through trader-risk and your yes.
+  protect   crypto only: Alpaca has no bracket orders for coins, so once the
+            buy fills this builds the stop-limit sell at the plan's stop
+            (good until canceled). It still goes through trader-risk and your yes.
   log       prints today's decisions.
 
     python3 ticket.py show                    # every order, READY or not
@@ -27,7 +30,11 @@ work around the one moment that matters, your yes:
     python3 ticket.py result --index 1 --status placed --broker-id 61e6...
     python3 ticket.py fill --symbol TSLA --side buy --qty 8 --price 364.20
     python3 ticket.py flatten --symbol TSLA --qty 8
+    python3 ticket.py protect --symbol BTC-USD           # crypto: the stop after the fill
     python3 ticket.py log
+
+Crypto pairs (BTC-USD) go to Alpaca's place_crypto_order instead of
+place_stock_order, with the pair written BTC/USD, never as a bracket.
 
 Everything is written to trader/state/broker.json (append only). Dates are
 New York dates; --now "2026-10-19 10:15" pins the clock.
@@ -51,6 +58,11 @@ TIF_WORDS = {"day": "good for today", "gtc": "good until canceled", "opg": "at t
              "cls": "at the close", "ioc": "immediate or cancel", "fok": "fill or kill"}
 YES_WORDS = ("yes", "y")
 BATCH_WORDS = {"all", "every", "everything", "rest", "remaining", "them", "both", "batch", "each"}
+CRYPTO = re.compile(r"^[A-Z0-9]{2,10}-(USD|USDT|USDC|EUR|GBP)$")
+CRYPTO_FIELDS = (("symbol", "symbol"), ("side", "side"), ("type", "order_type"), ("time_in_force", "time_in_force"),
+                 ("qty", "qty"), ("notional", "notional"), ("limit_price", "limit_price"),
+                 ("stop_price", "stop_price"), ("client_order_id", "client_order_id"))
+STOP_LIMIT_PCT = 0.5   # the protective stop-limit's limit sits 0.5 % under its stop (same as trader-budget)
 DOUBT_WORDS = {"no", "not", "dont", "don't", "wait", "cancel", "stop", "but", "maybe", "later",
                "hold", "unless", "if"}
 
@@ -165,10 +177,26 @@ def _f(x):
         return None
 
 
+def is_crypto(sym):
+    return bool(CRYPTO.match(str(sym or "").strip().upper()))
+
+
+def tool_name(order):
+    return "place_crypto_order" if is_crypto(order.get("symbol")) else "place_stock_order"
+
+
 def tool_input(order):
     """The exact arguments for place_stock_order: Alpaca's parameter names,
     numbers as strings (its signature types qty, notional and prices as str).
-    "why" and "plan" are ours and are never sent."""
+    "why" and "plan" are ours and are never sent. A crypto pair goes to
+    place_crypto_order: the pair as BTC/USD, "type" sent as order_type."""
+    if is_crypto(order.get("symbol")):
+        out = {}
+        for k, name in CRYPTO_FIELDS:
+            if k in order and order[k] is not None:
+                out[name] = _str_num(order[k]) if k in STRING_FIELDS else order[k]
+        out["symbol"] = str(order["symbol"]).upper().replace("-", "/")
+        return out
     out = {}
     for k in ALPACA_FIELDS:
         if k in order and order[k] is not None:
@@ -234,6 +262,8 @@ def plain_parts(order):
         return parts
     if order.get("notional") is not None:
         what = "%s of %s" % (_money(order["notional"]), sym)
+    elif is_crypto(sym):
+        what = "%s %s (%s)" % (_str_num(order.get("qty")), sym.split("-")[0], sym.replace("-", "/"))
     else:
         q = _str_num(order.get("qty"))
         what = "%s share%s of %s" % (q, "" if q == "1" else "s", sym)
@@ -245,7 +275,16 @@ def plain_parts(order):
         how = "stop %s, limit %s" % (_money(order.get("stop_price")), _money(order.get("limit_price")))
     else:
         how = "%s order" % typ.replace("_", " ")
-    return ["%s %s, %s, %s" % (side, what, how, tif)]
+    parts = ["%s %s, %s, %s" % (side, what, how, tif)]
+    if is_crypto(sym) and str(order.get("side", "")).lower() == "buy":
+        plan = order.get("plan") or {}
+        if plan.get("stop"):
+            parts.append("no stop at the broker yet: after the fill, ticket.py protect (stop %s)" % _p(plan["stop"]))
+        loss, stop = max_loss(order)
+        if loss is not None:
+            parts.append("max loss about %s if the stop fills at %s (it can fill worse, or not at all)"
+                         % (_money(loss), _p(stop)))
+    return parts
 
 
 def plain(order):
@@ -366,7 +405,7 @@ def render(order, idx, total, cfg, risk, state, today):
         lines.append("  Claude drafts this with the Interactive Brokers connector. IBKR sends it to your")
         lines.append("  IBKR account, and it only goes to the market after you approve it there.")
     else:
-        lines.append("  Claude will call place_stock_order with exactly:")
+        lines.append("  Claude will call %s with exactly:" % tool_name(order))
         for l in json.dumps(tool_input(order), indent=2).splitlines():
             lines.append("    " + l)
         if is_bracket(order):
@@ -384,7 +423,7 @@ def ticket_json(order, idx, cfg, risk, state, today):
     loss, stop = max_loss(order)
     return {"index": idx, "ready": ready, "status": label, "plain": plain(order),
             "fingerprint": fingerprint(order), "paper": bool(cfg.get("paper", True)),
-            "broker": cfg.get("broker", "alpaca"), "tool": "place_stock_order",
+            "broker": cfg.get("broker", "alpaca"), "tool": tool_name(order),
             "tool_input": tool_input(order), "why": order.get("why", ""),
             "bracket": is_bracket(order), "max_loss": loss, "stop": stop}
 
@@ -519,7 +558,7 @@ def cmd_approve(a):
     if str(cfg.get("broker", "alpaca")).lower() == "ibkr":
         print("Now draft it with the Interactive Brokers connector; approve it in your IBKR account.")
     else:
-        print("Now call place_stock_order with exactly:")
+        print("Now call %s with exactly:" % tool_name(order))
         print(json.dumps(tool_input(order), indent=2))
         print("Claude's card shows Allow once / Deny. Then: ticket.py result --index %d --status "
               "placed|denied|failed" % a.index)
@@ -566,6 +605,13 @@ def cmd_result(a):
               % (rec["symbol"], rec["side"]))
         if rec.get("kind") == "entry" and is_bracket(order):
             print("When the stop-loss or the take-profit fills later, record that sell the same way.")
+        if rec.get("kind") == "entry" and is_crypto(rec["symbol"]) and rec["side"] == "buy":
+            print("Then protect it: ticket.py protect --symbol %s (crypto has no bracket: until that stop "
+                  "is placed, nothing at the broker limits the loss)." % rec["symbol"])
+    if a.status == "placed" and a.filled_qty and a.filled_price and rec.get("kind") == "entry" \
+            and is_crypto(rec["symbol"]) and rec["side"] == "buy":
+        print("Next: ticket.py protect --symbol %s writes the stop-limit sell; it goes through trader-risk "
+              "and your yes like any order." % rec["symbol"])
     return 0
 
 
@@ -601,11 +647,16 @@ def cmd_flatten(a):
             raise TicketError("nothing to flatten: no %s shares in %s. Check the broker (get_open_position "
                               "%s) and pass --qty if you do hold some" % (sym, a.portfolio, sym))
     plan = read_json(a.plan, "plan", required=False) or {}
+    coin = is_crypto(sym)
+    crypto_cfg = cfg.get("crypto") or {}
     flat_by = (plan.get("flat_by") if str(plan.get("symbol", "")).upper() == sym else None) \
-        or cfg.get("flat_by") or "15:55"
-    order = {"symbol": sym, "side": "sell", "qty": _str_num(qty), "type": "market", "time_in_force": "day",
-             "why": "flat by %s New York: closes the %s day trade before the close (qty from %s)"
-             % (flat_by, sym, source)}
+        or (crypto_cfg.get("flat_by") or "23:55" if coin else cfg.get("flat_by") or "15:55")
+    order = {"symbol": sym, "side": "sell", "qty": _str_num(qty), "type": "market",
+             "time_in_force": "gtc" if coin else "day",
+             "why": "flat by %s %s: closes the %s day trade before %s (qty from %s)"
+             % (flat_by, "UTC" if coin else "New York", sym, "midnight UTC" if coin else "the close", source)}
+    if coin:
+        order["asset_class"] = "crypto"
     old = read_json(a.orders, "orders", required=False)
     replaced = len(old.get("orders", [])) if isinstance(old, dict) else 0
     doc = {"created_by": "trader-broker", "created_at": now.strftime("%Y-%m-%dT%H:%M:%SZ"), "status": "proposed",
@@ -613,7 +664,7 @@ def cmd_flatten(a):
            "note": "Flatten ticket. Nothing is placed until trader-risk passes it and you say yes in the chat.",
            "source": "ticket.py flatten %s on %s" % (sym, today), "orders": [order]}
     write_json(a.orders, doc)
-    print("Flatten %s: %s (flat by %s New York)." % (sym, plain(order), flat_by))
+    print("Flatten %s: %s (flat by %s %s)." % (sym, plain(order), flat_by, "UTC" if coin else "New York"))
     print("Wrote it to %s%s." % (a.orders, (" (it replaced %d earlier proposal%s)"
                                              % (replaced, "" if replaced == 1 else "s")) if replaced else ""))
     if a.qty is None:
@@ -622,9 +673,64 @@ def cmd_flatten(a):
     print("  1. trader-risk: check.py. A sell that only closes what you hold is never blocked by the daily")
     print("     limits or the entry window.")
     print("  2. ticket.py show, then the user's yes for this one order.")
+    if coin:
+        print("  3. If the protective stop-limit is still open, Alpaca holds these coins for it and rejects a")
+        print("     new sell. Cancel it first: get_orders (status open), then cancel_order_by_id (Needs")
+        print("     approval). Then place_crypto_order with the ticket.")
+        return 0
     print("  3. If the bracket's stop-loss and take-profit are still open, Alpaca holds these shares for them")
     print("     and rejects a new sell. Cancel them first: get_orders (status open, nested true), then")
     print("     cancel_order_by_id for each open leg (Needs approval). Then place_stock_order with the ticket.")
+    return 0
+
+
+def cmd_protect(a):
+    """Crypto: the stop-limit sell that Alpaca cannot attach to the buy as a bracket."""
+    cfg = read_json(a.config, "config", required=False) or {}
+    sym = a.symbol.strip().upper()
+    if not is_crypto(sym):
+        raise TicketError("protect is for crypto pairs (BTC-USD): a stock's stop rides in its bracket order")
+    now, today = _clock(a)
+    plan = read_json(a.plan, "plan", required=False) or {}
+    if str(plan.get("symbol", "")).upper() != sym and a.stop is None:
+        raise TicketError("%s has no plan for %s: give --stop PRICE" % (a.plan, sym))
+    stop = _f(a.stop) if a.stop is not None else _f(plan.get("stop"))
+    if not stop or stop <= 0:
+        raise TicketError("no stop price: give --stop PRICE, or plan the trade with trader-exit")
+    source = "the broker, get_open_position"
+    if a.qty is not None:
+        qty = _f(a.qty)
+        if qty is None or qty <= 0:
+            raise TicketError("--qty wants how much you hold, like --qty 0.055654")
+    else:
+        pf = read_json(a.portfolio, "portfolio", required=False) or {}
+        qty = sum(_f(p.get("shares", p.get("qty"))) or 0 for p in pf.get("positions", [])
+                  if str(p.get("ticker") or p.get("symbol") or "").upper() == sym)
+        source = a.portfolio
+        if qty <= 1e-9:
+            raise TicketError("nothing to protect: no %s in %s. Record the fill first (ticket.py fill), or pass "
+                              "--qty" % (sym, a.portfolio))
+    limit = _f(a.limit) if a.limit is not None else int(stop * (1 - STOP_LIMIT_PCT / 100.0) * 100 + 0.5) / 100.0
+    if not limit or limit <= 0 or limit > stop:
+        raise TicketError("the limit %s must be above 0 and at or under the stop %s" % (a.limit, _p(stop)))
+    order = {"symbol": sym, "side": "sell", "qty": _str_num(qty), "type": "stop_limit",
+             "stop_price": _p(stop), "limit_price": _p(limit), "time_in_force": "gtc", "asset_class": "crypto",
+             "why": "protects the %s position: sells if the price trades down to the stop %s, at %s or better "
+                    "(qty from %s)" % (sym, _p(stop), _p(limit), source)}
+    old = read_json(a.orders, "orders", required=False)
+    replaced = len(old.get("orders", [])) if isinstance(old, dict) else 0
+    doc = {"created_by": "trader-broker", "created_at": now.strftime("%Y-%m-%dT%H:%M:%SZ"), "status": "proposed",
+           "paper": bool(cfg.get("paper", True)),
+           "note": "Protective stop. Nothing is placed until trader-risk passes it and you say yes in the chat.",
+           "source": "ticket.py protect %s on %s" % (sym, today), "orders": [order]}
+    write_json(a.orders, doc)
+    print("Protect %s: %s." % (sym, plain(order)))
+    print("Wrote it to %s%s." % (a.orders, (" (it replaced %d earlier proposal%s)"
+                                             % (replaced, "" if replaced == 1 else "s")) if replaced else ""))
+    print("A stop-limit only sells at %s or better: in a crash that skips past it, it may not fill at all." % _p(limit))
+    print("Next: check.py (a sell of what you hold is never blocked by the daily limits), ticket.py show, the")
+    print("user's yes for this one order, then place_crypto_order. The target is an alert, not an order:")
+    print("alerts.py add --from-plan, and sell by hand (cancel this stop first) if it rings.")
     return 0
 
 
@@ -700,6 +806,16 @@ def main(argv=None):
     p.add_argument("--plan", default="trader/plan.json")
     p.add_argument("--config", default="trader/config.json")
     clock(p)
+    p = sub.add_parser("protect", help="crypto: the stop-limit sell at the plan's stop, after the buy fills")
+    p.add_argument("--symbol", required=True)
+    p.add_argument("--qty", help="how much you hold, from get_open_position (default: trader/portfolio.json)")
+    p.add_argument("--stop", help="stop price (default: the plan's stop)")
+    p.add_argument("--limit", help="limit price (default: %.1f %% under the stop)" % STOP_LIMIT_PCT)
+    p.add_argument("--orders", default="trader/orders.json", help="where the ticket is written")
+    p.add_argument("--portfolio", default="trader/portfolio.json")
+    p.add_argument("--plan", default="trader/plan.json")
+    p.add_argument("--config", default="trader/config.json")
+    clock(p)
     p = sub.add_parser("log", help="today's decisions")
     p.add_argument("--state", default="trader/state/broker.json")
     clock(p)
@@ -710,7 +826,7 @@ def main(argv=None):
         return 1
     try:
         return {"show": cmd_show, "approve": cmd_approve, "decline": cmd_decline, "result": cmd_result,
-                "fill": cmd_fill, "flatten": cmd_flatten, "log": cmd_log}[a.cmd](a)
+                "fill": cmd_fill, "flatten": cmd_flatten, "protect": cmd_protect, "log": cmd_log}[a.cmd](a)
     except TicketError as e:
         print("ticket.py: %s" % e, file=sys.stderr)
         return 1

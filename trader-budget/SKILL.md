@@ -12,6 +12,8 @@ description: >-
   trade", "how much should I buy", "I have $5,000", "I only want to risk $50
   a trade", "set my rules", "keep 10% in cash", or after /trader-exit writes
   a plan.
+  Crypto pairs too (BTC-USD): fractional coins, one buy order
+  (Alpaca has no crypto brackets).
 argument-hint: "[budget in dollars]"
 ---
 
@@ -139,6 +141,18 @@ With `"fractional": false` (the example config) it buys whole shares and
 needs prices (`--prices trader/prices.json`). These are plain buys with no stop: trader-risk blocks them while
 `require_stop` is true and counts each one against `max_trades_per_day`. Use
 a separate config (`--config`) for a long-term split.
+
+## Crypto (BTC-USD)
+
+A plan for a crypto pair is sized in millionths of a coin, rounded down
+(0.055654 BTC), under the same four limits. Alpaca takes no bracket orders for
+crypto, so the proposal is ONE buy: market (or `--limit`), `time_in_force`
+`"gtc"`, `"asset_class": "crypto"`. Its `plan` keeps the stop, the target and
+`stop_limit_price` (0.5 % under the stop). Once the buy fills,
+`trader-broker`'s `ticket.py protect` writes the stop-limit sell; the target
+is an alert. Tell the user plainly: until that stop is placed nothing at the
+broker limits the loss, and a stop-limit can skip past its limit in a crash
+and not fill at all. The max loss shown is the loss at the stop price.
 
 ## Rules
 

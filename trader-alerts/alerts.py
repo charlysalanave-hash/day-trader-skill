@@ -27,7 +27,9 @@ Rule types:
                   "flat by close" rings at 12:55 on those days
 
 A rule with "date" is only watched on that New York date (rules from a plan
-are for the plan's day only). An above / below alert rings ONCE and then stays
+are for the plan's day only). A rule with "tz": "UTC" (a crypto pair like
+BTC-USD: the market never closes) reads the UTC clock and the UTC date, and a
+time rule rings every day, weekends and holidays too. An above / below alert rings ONCE and then stays
 quiet until you reset it, unless the rule has "rearm": true (it re-arms when
 the price crosses back). A pct_move alert rings at most once per day.
 
@@ -62,6 +64,11 @@ PAUSE = 0.5    # seconds between requests: be polite to free endpoints
 BACKOFF = 2.0  # seconds to wait before the one retry after a 429
 YAHOO_HOSTS = ("query2.finance.yahoo.com", "query1.finance.yahoo.com")
 HHMM = re.compile(r"^([01]?\d|2[0-3]):([0-5]\d)$")
+CRYPTO = re.compile(r"^[A-Z0-9]{2,10}-(USD|USDT|USDC|EUR|GBP)$")
+
+
+def is_crypto(sym):
+    return bool(CRYPTO.match(str(sym or "").strip().upper()))
 
 NYSE_HOLIDAYS = {
     "2026-01-01": "New Year's Day",
@@ -406,15 +413,15 @@ def active(rule, today):
     return not rule.get("date") or str(rule["date"]) == today
 
 
-def _rang_today(stamp, today):
-    """Did a rule that rang at this UTC stamp ring on this New York date?"""
+def _rang_today(stamp, today, utc_day=False):
+    """Did a rule that rang at this UTC stamp ring on this New York date (this UTC date for crypto)?"""
     if not stamp:
         return False
     try:
         utc = datetime.datetime.strptime(stamp[:19], "%Y-%m-%dT%H:%M:%S")
     except ValueError:
         return stamp[:10] == today
-    return to_eastern(utc).date().isoformat() == today
+    return (utc if utc_day else to_eastern(utc)).date().isoformat() == today
 
 
 def ring_time(rule, status):
@@ -436,7 +443,25 @@ def evaluate(rules, quotes, status, state, now_utc):
     for r in rules:
         validate(r)
         rid = r.get("id") or "%s-%s" % (r.get("symbol", "market"), r["type"])
-        if not active(r, today):
+        utc_rule = r.get("tz") == "UTC"
+        if utc_rule:
+            if not active(r, now_utc.date().isoformat()):
+                continue
+            if r["type"] == "time":
+                at, day = _hhmm(r.get("at")), now_utc.date().isoformat()
+                if now_utc.time() >= at and not _rang_today(rung.get(rid), day, True):
+                    sym = str(r.get("symbol") or "").upper()
+                    msg = "%s%s: it is %s UTC (set for %s UTC); crypto never closes, so this is your own cutoff." % (
+                        (r.get("label") or "time alert")[:1].upper(), (r.get("label") or "time alert")[1:],
+                        now_utc.strftime("%H:%M"), at.strftime("%H:%M"))
+                    if sym:
+                        msg += (" If %s is still open, close it: cancel its protective stop, then trader-broker "
+                                "flatten --symbol %s builds the sell ticket, then trader-risk and your yes."
+                                % (sym, sym))
+                    rings.append({"id": rid, "symbol": sym, "message": msg})
+                    rung[rid] = stamp
+                continue
+        elif not active(r, today):
             continue
         typ = {"stop": "below", "target": "above"}.get(r["type"], r["type"])
         if typ == "opening_bell":
@@ -472,7 +497,7 @@ def evaluate(rules, quotes, status, state, now_utc):
                 word = "at or above" if typ == "above" else "at or below"
                 label = {"stop": "stop", "target": "target"}.get(r["type"], "alert level")
                 rings.append({"id": rid, "symbol": sym, "message": "%s %s $%.2f: %s your %s $%s%s."
-                              % (sym, "is" if status["open"] else "last", p, word, label, _n(r["price"]),
+                              % (sym, "is" if status["open"] or utc_rule else "last", p, word, label, _n(r["price"]),
                                  (" (" + r["note"] + ")") if r.get("note") else "")})
                 rung[rid] = stamp
             elif not hit and rid in rung and r.get("rearm"):
@@ -484,7 +509,7 @@ def evaluate(rules, quotes, status, state, now_utc):
             move = 100.0 * (p / float(ref) - 1)
             want = r.get("direction")
             hit = abs(move) >= r["pct"] and (not want or (want == "up") == (move > 0))
-            if hit and not _rang_today(rung.get(rid), today):
+            if hit and not _rang_today(rung.get(rid), now_utc.date().isoformat() if utc_rule else today, utc_rule):
                 rings.append({"id": rid, "symbol": sym, "message": "%s moved %+.2f%% to $%.2f (from $%.2f)."
                               % (sym, move, p, float(ref))})
                 rung[rid] = stamp
@@ -510,11 +535,18 @@ def rules_from_plan(plan, cfg_flat_by=None):
         label = plan.get("%s_label" % key)
         out.append({"id": "%s-plan-%s" % (sym.lower(), key), "symbol": sym, "type": typ, "price": float(v),
                     "note": word + (": " + label if label else "")})
-    flat = plan.get("flat_by") or cfg_flat_by or "15:55"
+    coin = is_crypto(sym) or plan.get("market") == "crypto"
+    flat = plan.get("flat_by") or cfg_flat_by or ("23:55" if coin else "15:55")
     if _hhmm(flat) is None:
         raise AlertError("the plan's flat_by %r is not a time like 15:55" % flat)
-    out.append({"id": "%s-flat-by" % sym.lower(), "symbol": sym, "type": "time", "at": flat,
-                "label": "flat by close", "before_close": True})
+    if coin:
+        out.append({"id": "%s-flat-by" % sym.lower(), "symbol": sym, "type": "time", "at": flat,
+                    "label": "flat by", "tz": "UTC"})
+        for r in out:
+            r["tz"] = "UTC"
+    else:
+        out.append({"id": "%s-flat-by" % sym.lower(), "symbol": sym, "type": "time", "at": flat,
+                    "label": "flat by close", "before_close": True})
     if plan.get("date"):
         for r in out:
             r["date"] = str(plan["date"])
@@ -592,7 +624,7 @@ def cmd_check(a):
     rules = doc["rules"]
     now = parse_now(a.now)
     status = market_status(now)
-    watched = [r for r in rules if active(r, status["date"])]
+    watched = [r for r in rules if active(r, now.date().isoformat() if r.get("tz") == "UTC" else status["date"])]
     syms = _dedupe([str(r.get("symbol", "")).upper() for r in watched if r.get("type") not in NO_QUOTE])
     quotes, errors = (get_quotes(syms, a.source, a.offline) if syms else ({}, []))
     state = _read(a.state, {})
@@ -619,6 +651,9 @@ def cmd_check(a):
             print("An alert is information, not an order. A bracket's stop-loss and take-profit already sit at "
                   "the broker: check get_open_position and record any fill (ticket.py fill). To close a "
                   "position yourself: ticket.py flatten, then trader-risk and your yes.")
+            if any(is_crypto(r.get("symbol")) for r in rings):
+                print("Crypto has no bracket: only the stop-limit from ticket.py protect sits at the broker. "
+                      "At the target, cancel that stop and sell (ticket.py flatten).")
     return 0 if rings else 1
 
 
@@ -630,7 +665,9 @@ def cmd_add(a):
         if plan is None:
             raise AlertError("no plan at %s (run trader-exit first)" % a.plan)
         cfg = _read(a.config, {}) if a.config else {}
-        new = rules_from_plan(plan, (cfg or {}).get("flat_by"))
+        coin = isinstance(plan, dict) and is_crypto(plan.get("symbol"))
+        new = rules_from_plan(plan, ((cfg or {}).get("crypto") or {}).get("flat_by") if coin
+                              else (cfg or {}).get("flat_by"))
         ids = {r["id"] for r in new}
         doc["rules"] = [r for r in doc["rules"] if r.get("id") not in ids] + new
         state = _read(a.state, {})
@@ -643,6 +680,9 @@ def cmd_add(a):
             print("Added %s: %s" % (r["id"], json.dumps(r)))
         print("Run alerts.py check every few minutes while the trade is open (a scheduled task or /loop). "
               "Free quotes are delayed; the broker's bracket orders are what actually stop you out.")
+        if coin:
+            print("Crypto has no bracket: the target is this alert only, and the stop at the broker is the "
+                  "stop-limit from ticket.py protect. Place it as soon as the buy fills.")
         return 0
     if a.opening_bell:
         rule = {"id": a.id or "opening-bell", "type": "opening_bell"}
@@ -681,6 +721,9 @@ def cmd_add(a):
             rule["note"] = a.note
     if a.date:
         rule["date"] = a.date
+    if is_crypto(rule.get("symbol")):
+        rule["tz"] = "UTC"   # crypto: the UTC clock and date, every day
+        rule.pop("before_close", None)
     validate(rule)
     if any(r.get("id") == rule["id"] for r in doc["rules"]):
         raise AlertError("a rule with id %s already exists" % rule["id"])

@@ -56,6 +56,7 @@ import datetime
 import json
 import math
 import os
+import re
 import sys
 
 # v2 defaults: the contract's config.example.json. Missing keys fall back to these.
@@ -87,6 +88,38 @@ EPS = 1e-9
 FRESH_MINUTES = 15
 SETUP_WORDS = {"orb": "opening-range breakout", "flag": "flag", "bounce": "oversold bounce"}
 
+TZ = "ET"
+
+# Crypto pairs (Yahoo's BTC-USD) trade around the clock. In crypto mode the day
+# is 00:00 to 24:00 UTC, every day of the year, and every clock in this tool
+# reads UTC instead of New York (the config's "crypto" section sets the times).
+CRYPTO = re.compile(r"^[A-Z0-9]{2,10}-(USD|USDT|USDC|EUR|GBP)$")
+CRYPTO_WINDOW = {"no_entries_before": "00:20", "no_entries_after": "23:00", "flat_by": "23:55"}  # UTC
+QTY_DP = 6           # crypto quantities: whole millionths of a coin (Alpaca takes up to 9 decimals)
+STOP_LIMIT_PCT = 0.5  # crypto's protective stop is a stop-limit (Alpaca has no crypto brackets): limit 0.5 % under
+MARKET = {"crypto": False}
+
+
+def is_crypto(sym):
+    return bool(CRYPTO.match(str(sym or "").strip().upper()))
+
+
+def use_market(crypto):
+    """Switch the whole tool to crypto (UTC days, fractional coins) or back to stocks."""
+    global TZ
+    MARKET["crypto"] = bool(crypto)
+    TZ = "UTC" if crypto else "ET"
+
+
+def crypto_config(cfg):
+    """In crypto mode the times come from the config's "crypto" section (UTC), never
+    from the New York keys: 09:45 ET means nothing to a market that never closes."""
+    if not MARKET["crypto"]:
+        return cfg
+    out = dict(cfg, **CRYPTO_WINDOW)
+    out.update(cfg.get("crypto") or {})
+    return out
+
 
 class SizeError(Exception):
     pass
@@ -104,6 +137,8 @@ def eastern_offset(utc):
     """Hours from UTC for New York: -4 in daylight time, -5 otherwise.
     DST runs from 2:00 a.m. on the second Sunday of March to 2:00 a.m. on the
     first Sunday of November (US rule since 2007)."""
+    if MARKET["crypto"]:
+        return 0  # crypto mode reads UTC
     y = utc.year
     start = datetime.datetime.combine(_nth_sunday(y, 3, 2), datetime.time(7, 0))   # 2:00 EST
     end = datetime.datetime.combine(_nth_sunday(y, 11, 1), datetime.time(6, 0))    # 2:00 EDT
@@ -116,6 +151,8 @@ def to_eastern(utc):
 
 
 def eastern_to_utc(local):
+    if MARKET["crypto"]:
+        return local
     for off in (-4, -5):
         utc = local - datetime.timedelta(hours=off)
         if eastern_offset(utc) == off:
@@ -273,11 +310,28 @@ def round_cent(x):
 
 
 def shares_for(usd, per_share):
-    """Whole shares that fit in usd at per_share, in exact integer cents."""
+    """Whole shares that fit in usd at per_share, in exact integer cents. Crypto: whole
+    millionths of a coin, rounded down (0.037218 BTC), still in exact integers."""
     u, p = int(round(float(usd) * 100)), int(round(float(per_share) * 100))
     if p <= 0 or u <= 0:
         return 0
+    if MARKET["crypto"]:
+        return (u * 10 ** QTY_DP // p) / float(10 ** QTY_DP)
     return u // p
+
+
+def qty_str(q):
+    """Alpaca wants quantities as strings: "8", or "0.037218" for a coin."""
+    if MARKET["crypto"]:
+        return ("%.*f" % (QTY_DP, q)).rstrip("0").rstrip(".") or "0"
+    return str(int(q))
+
+
+def units(q, sym=""):
+    """8 shares, 0.037218 BTC."""
+    if MARKET["crypto"]:
+        return "%s %s" % (qty_str(q), sym.split("-")[0] if sym else "coins")
+    return "%d share%s" % (q, "" if q == 1 else "s")
 
 
 def _price(x):
@@ -320,8 +374,8 @@ def size_trade(plan, cfg, budget=None, limit=None, price=None, cash=None, today=
     if side != "buy":
         raise SizeError("this pack sizes long (buy) day trades only; the plan says %r" % side)
     if today and plan.get("date") and str(plan["date"]) != today:
-        raise SizeError("the plan is for %s and today is %s in New York: make a new plan with trader-exit"
-                        % (plan["date"], today))
+        raise SizeError("the plan is for %s and today is %s in %s: make a new plan with trader-exit"
+                        % (plan["date"], today, "UTC" if MARKET["crypto"] else "New York"))
     entry_plan, stop, target = _f(plan.get("entry")), _f(plan.get("stop")), _f(plan.get("target"))
     for name, v in (("entry", entry_plan), ("stop", stop), ("target", target)):
         if v is None or v <= 0:
@@ -367,7 +421,8 @@ def size_trade(plan, cfg, budget=None, limit=None, price=None, cash=None, today=
     max_loss = _f(c.get("max_loss_per_trade_usd"))
     if max_loss:
         limits.append({"name": "max loss", "usd": max_loss, "per": risk, "shares": shares_for(max_loss, risk),
-                       "how": "%s max loss / %s risk a share" % (money(max_loss), _price(risk))})
+                       "how": "%s max loss / %s risk a %s" % (money(max_loss), _price(risk),
+                                                               "coin" if MARKET["crypto"] else "share")})
     cap_pct = _f(c.get("max_position_pct"))
     if cap_pct:
         cap = round(budget * cap_pct / 100.0, 2)
@@ -400,8 +455,8 @@ def size_trade(plan, cfg, budget=None, limit=None, price=None, cash=None, today=
                    "would block it. No order. Skip it, or make a new plan with trader-exit."
                    % (reward_c / float(risk_c), _price(target), _price(ref), _price(stop), _num(c["min_reward_risk"])))
     elif cost < float(c.get("min_order_usd") or 0) - 0.005:
-        refusal = ("%d share%s of %s is %s, under your %s minimum order. No order."
-                   % (qty, "" if qty == 1 else "s", sym, money(cost), money(c["min_order_usd"])))
+        refusal = ("%s of %s is %s, under your %s minimum order. No order."
+                   % (units(qty, sym), sym, money(cost), money(c["min_order_usd"])))
     return {
         "symbol": sym, "side": "buy", "setup": plan.get("setup", ""), "date": plan.get("date"),
         "entry_time": plan.get("entry_time", ""), "entry_plan": round_cent(entry_plan),
@@ -415,10 +470,36 @@ def size_trade(plan, cfg, budget=None, limit=None, price=None, cash=None, today=
     }
 
 
+def crypto_order(s):
+    """Crypto: Alpaca has no bracket orders for coins, so the proposal is the buy alone
+    (good until canceled: the market never closes). Its plan carries the stop and the
+    target; once it fills, trader-broker's protect writes the stop-limit sell at the stop."""
+    o = {"symbol": s["symbol"], "side": "buy", "qty": qty_str(s["qty"]), "type": s["order_type"],
+         "time_in_force": "gtc", "asset_class": "crypto"}
+    if s["order_type"] == "limit":
+        o["limit_price"] = _price(s["entry"])
+    setup = SETUP_WORDS.get(s["setup"], s["setup"] or "day trade")
+    bound = {"max loss": "%s max loss per trade" % money(s["max_loss_per_trade_usd"] or 0),
+             "position cap": "position cap", "max order": "max order", "cash": "cash after the buffer"}[s["bound_by"]]
+    o.update({
+        "why": "%s on %s: %s, bound by your %s (%s x %s = %s at the stop)"
+               % (setup, s["symbol"], units(s["qty"], s["symbol"]), bound, qty_str(s["qty"]),
+                  _price(s["risk_per_share"]), money(s["max_loss"])),
+        "plan": {"entry": s["entry"], "stop": s["stop"], "target": s["target"],
+                 "risk_per_share": s["risk_per_share"], "max_loss": s["max_loss"], "setup": s["setup"],
+                 "entry_time": s["entry_time"], "flat_by": s["flat_by"],
+                 "stop_limit_price": round_cent(s["stop"] * (1 - STOP_LIMIT_PCT / 100.0)),
+                 "protect": "after the fill: trader-broker protect writes a stop-limit sell at the stop"},
+    })
+    return o
+
+
 def bracket_order(s):
     """The one proposed order, Alpaca place_stock_order fields (strings) plus why and plan."""
     if s["refusal"] or s["qty"] <= 0:
         return None
+    if MARKET["crypto"]:
+        return crypto_order(s)
     o = {"symbol": s["symbol"], "side": "buy", "qty": str(int(s["qty"])), "type": s["order_type"],
          "time_in_force": "day"}
     if s["order_type"] == "limit":
@@ -453,24 +534,43 @@ def plan_report(s, order, notes=()):
         lines.append(n)
     src = {"plan": "the plan's entry", "price": "the latest price, above the plan's entry",
            "limit": "your limit price"}[s["entry_from"]]
-    lines.append("Sized at %s (%s). Risk %s a share (entry %s minus stop %s). Reward:risk %.2f."
-                 % (_price(s["entry"]), src, _price(s["risk_per_share"]), _price(s["entry"]), _price(s["stop"]),
-                    s["reward_risk"]))
+    lines.append("Sized at %s (%s). Risk %s a %s (entry %s minus stop %s). Reward:risk %.2f."
+                 % (_price(s["entry"]), src, _price(s["risk_per_share"]), "coin" if MARKET["crypto"] else "share",
+                    _price(s["entry"]), _price(s["stop"]), s["reward_risk"]))
     lines.append("")
-    lines.append("Limits (whole shares; the smallest one wins):")
+    lines.append("Limits (%s; the smallest one wins):" % ("millionths of a coin" if MARKET["crypto"]
+                                                           else "whole shares"))
     for l in s["limits"]:
-        lines.append("  %-13s %-58s %3d shares%s" % (l["name"], l["how"], l["shares"],
-                                                      "  <- binds" if l["binds"] else ""))
+        lines.append("  %-13s %-58s %s%s" % (l["name"], l["how"],
+                                             units(l["shares"], s["symbol"]) if MARKET["crypto"]
+                                             else "%3d shares" % l["shares"], "  <- binds" if l["binds"] else ""))
     lines.append("")
     if order is None:
         lines.append("No order: " + s["refusal"])
         lines.append("Education and tooling, not financial advice.")
         return "\n".join(lines)
-    lines.append("Size: %d shares of %s = %s at %s. Max loss at the stop: %d x %s = %s."
-                 % (s["qty"], s["symbol"], money(s["cost"]), _price(s["entry"]), s["qty"],
-                    _price(s["risk_per_share"]), money(s["max_loss"])))
+    lines.append("Size: %s of %s = %s at %s. Max loss at the stop: %s x %s = %s."
+                 % (units(s["qty"], s["symbol"]), s["symbol"], money(s["cost"]), _price(s["entry"]),
+                    qty_str(s["qty"]), _price(s["risk_per_share"]), money(s["max_loss"])))
     lines.append("A stop is an order, not a promise: in a fast market it can fill below %s." % _price(s["stop"]))
     lines.append("")
+    if MARKET["crypto"]:
+        how = "limit %s" % order["limit_price"] if order["type"] == "limit" else "market"
+        lines.append("Proposed crypto order (place_crypto_order, nothing has been placed):")
+        lines.append("  buy %s %s, %s, good until canceled" % (order["qty"], order["symbol"], how))
+        lines.append("Alpaca has no bracket orders for crypto: once it fills, trader-broker protect writes the "
+                     "stop-limit sell (stop %s, limit %s), and trader-alerts rings at the target %s."
+                     % (_price(s["stop"]), _price(order["plan"]["stop_limit_price"]), _price(s["target"])))
+        lines.append("Until that stop is placed, nothing protects the position. A stop-limit can also skip "
+                     "past its limit in a crash and not fill at all.")
+        if s["flat_by"]:
+            lines.append("Flat by %s UTC: anything still open then gets closed (trader-alerts rings, "
+                         "trader-broker flatten)." % s["flat_by"])
+        lines.append("")
+        lines.append("Next: trader-risk checks it (crypto needs \"allow_crypto\": true in your config), then "
+                     "trader-broker asks you yes or no.")
+        lines.append("Education and tooling, not financial advice.")
+        return "\n".join(lines)
     lines.append("Proposed bracket order (place_stock_order arguments, nothing has been placed):")
     how = "limit %s" % order["limit_price"] if order["type"] == "limit" else "market"
     lines.append("  buy %s %s, %s, day, take-profit %s, stop-loss %s"
@@ -773,9 +873,11 @@ def write_orders(path, orders, cfg, source="", now_utc=None):
 # ---------------------------------------------------------------- main
 
 def run_plan(a, cfg):
+    plan = read_json(a.plan, "plan (run trader-exit first, or use --weights for a split)")
+    use_market(is_crypto((plan or {}).get("symbol")) if isinstance(plan, dict) else False)
+    cfg = crypto_config(cfg)
     now = parse_now(a.now)
     today = to_eastern(now).date().isoformat()
-    plan = read_json(a.plan, "plan (run trader-exit first, or use --weights for a split)")
     limit = None
     if a.limit is not None:
         if a.limit == "plan":
@@ -793,12 +895,14 @@ def run_plan(a, cfg):
         if p is not None and fresh:
             price = p
             if round_cent(p) > round_cent(_f(plan.get("entry")) or 0):
-                notes.append("%s last %s (as of %s New York) is above the plan's entry %s, so the risk "
+                notes.append("%s last %s (as of %s %s) is above the plan's entry %s, so the risk "
                              "is bigger: sized at %s." % (sym, _price(p), to_eastern(t).strftime("%H:%M"),
+                                                          "UTC" if MARKET["crypto"] else "New York",
                                                           _price(plan.get("entry")), _price(p)))
         elif p is not None:
             notes.append("%s in %s is %s: not used (older than %d minutes). Sized at the plan's entry."
-                         % (sym, ppath, ("from " + to_eastern(t).strftime("%Y-%m-%d %H:%M") + " New York")
+                         % (sym, ppath, ("from " + to_eastern(t).strftime("%Y-%m-%d %H:%M") + " " +
+                                         ("UTC" if MARKET["crypto"] else "New York"))
                             if t else "undated", FRESH_MINUTES))
     cash = None
     if a.portfolio and os.path.exists(a.portfolio):
@@ -814,7 +918,7 @@ def run_plan(a, cfg):
     else:
         print(plan_report(s, order, notes))
         if order and a.write:
-            print("Wrote 1 proposed bracket order to %s" % a.write)
+            print("Wrote 1 proposed %s order to %s" % ("crypto" if MARKET["crypto"] else "bracket", a.write))
     return 0 if order else 1
 
 

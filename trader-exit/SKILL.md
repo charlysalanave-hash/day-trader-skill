@@ -12,6 +12,7 @@ description: >-
   "where's my stop", "set my stop and target", "plan the exit", "when do I get
   out", "stop loss", "what's my R", "risk reward", or right after
   /trader-entry triggers, before /trader-timemachine.
+  Crypto pairs too (BTC-USD): flat by 23:55 UTC by default.
 argument-hint: "[--stop or-mid|or-low|price:X|pct:X|atr:K] [--target 2R|1R|price:X]"
 ---
 
@@ -104,6 +105,14 @@ Exit plan: TSLA long, Mon 2026-10-19, opening-range breakout on 5-minute bars
 
 The default 2R target would be 364.18 + 2 x 5.86 = 375.90. trader-budget then
 sizes it: a $50 max loss per trade buys floor(50 / 5.86) = 8 shares.
+
+## Crypto (BTC-USD)
+
+A plan for a crypto pair (from a crypto `entry.json`, or `--symbol BTC-USD`)
+reads UTC: `--now` is UTC, and `flat_by` comes from the config's `"crypto"`
+section (23:55 UTC by default: out before the UTC day ends, win or lose). The
+stops and targets are the same rules, priced per coin ("Risk a coin").
+`trader/plan.json` carries `"market": "crypto"`.
 
 ## Rules
 

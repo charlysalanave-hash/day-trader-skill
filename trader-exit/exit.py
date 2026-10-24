@@ -92,6 +92,37 @@ OPEN = datetime.time(9, 30)
 CLOSE = datetime.time(16, 0)
 EARLY = datetime.time(13, 0)
 
+TZ = "ET"
+
+# Crypto pairs (Yahoo's BTC-USD) trade around the clock. In crypto mode the day
+# is 00:00 to 24:00 UTC, every day of the year, and every clock in this tool
+# reads UTC instead of New York (the config's "crypto" section sets the times).
+CRYPTO = re.compile(r"^[A-Z0-9]{2,10}-(USD|USDT|USDC|EUR|GBP)$")
+CRYPTO_WINDOW = {"no_entries_before": "00:20", "no_entries_after": "23:00", "flat_by": "23:55"}  # UTC
+MARKET = {"crypto": False}
+
+
+def is_crypto(sym):
+    return bool(CRYPTO.match(str(sym or "").strip().upper()))
+
+
+def use_market(crypto):
+    """Switch the whole tool to crypto time (UTC, every day, 24 hours) or back to the NYSE."""
+    global OPEN, CLOSE, TZ
+    MARKET["crypto"] = bool(crypto)
+    OPEN, CLOSE, TZ = ((datetime.time(0, 0), datetime.time(23, 59, 59), "UTC") if crypto
+                       else (datetime.time(9, 30), datetime.time(16, 0), "ET"))
+
+
+def crypto_config(cfg):
+    """In crypto mode the times come from the config's "crypto" section (UTC), never
+    from the New York keys: 09:45 ET means nothing to a market that never closes."""
+    if not MARKET["crypto"]:
+        return cfg
+    out = dict(cfg, **CRYPTO_WINDOW)
+    out.update(cfg.get("crypto") or {})
+    return out
+
 
 class PlanError(Exception):
     pass
@@ -107,6 +138,8 @@ def _nth_sunday(year, month, n):
 
 def eastern_offset(utc):
     """Hours from UTC for New York: -4 in daylight time, -5 otherwise (US rule since 2007)."""
+    if MARKET["crypto"]:
+        return 0  # crypto mode reads UTC
     y = utc.year
     start = datetime.datetime.combine(_nth_sunday(y, 3, 2), datetime.time(7, 0))   # 2:00 EST
     end = datetime.datetime.combine(_nth_sunday(y, 11, 1), datetime.time(6, 0))    # 2:00 EDT
@@ -119,6 +152,8 @@ def to_eastern(utc):
 
 
 def eastern_to_utc(local):
+    if MARKET["crypto"]:
+        return local
     for off in (-4, -5):
         utc = local - datetime.timedelta(hours=off)
         if eastern_offset(utc) == off:
@@ -139,15 +174,16 @@ def parse_now(text):
     if not text:
         return utc_now()
     t = text.strip()
-    if t.upper().endswith(" ET"):
-        t = t[:-3].strip()
+    if t.upper().endswith((" ET", " UTC")):
+        t = t.rsplit(" ", 1)[0].strip()
     if re.match(r"^\d{1,2}:\d{2}$", t):
         t = "%s %s" % (to_eastern(utc_now()).date().isoformat(), t.zfill(5))
     t = t.replace("Z", "+00:00")
     try:
         dt = datetime.datetime.fromisoformat(t)
     except ValueError:
-        raise PlanError('--now wants a New York time like "2026-10-19 10:15" (or ...Z for UTC)')
+        raise PlanError('--now wants a %s time like "2026-10-19 10:15" (or ...Z for UTC)'
+                        % ("UTC" if MARKET["crypto"] else "New York"))
     if dt.tzinfo is None:
         return eastern_to_utc(dt)
     return (dt - dt.utcoffset()).replace(tzinfo=None)
@@ -180,12 +216,16 @@ def hm(t):
 
 
 def ampm(t):
+    if MARKET["crypto"]:
+        return "%02d:%02d" % (t.hour, t.minute)   # UTC reads on a 24-hour clock
     h = t.hour % 12 or 12
     return "%d:%02d %s" % (h, t.minute, "AM" if t.hour < 12 else "PM")
 
 
 def session(d):
-    """(open_time, close_time) in New York time, or None if closed all day."""
+    """(open_time, close_time) in New York time (UTC for crypto), or None if closed all day."""
+    if MARKET["crypto"]:
+        return OPEN, CLOSE
     if d.weekday() >= 5 or d.isoformat() in NYSE_HOLIDAYS:
         return None
     return OPEN, (EARLY if d.isoformat() in NYSE_EARLY_CLOSE else CLOSE)
@@ -499,6 +539,10 @@ def read_config(path):
         for k in DEFAULTS:
             if doc.get(k) is not None:
                 cfg[k] = doc[k]
+        if MARKET["crypto"]:
+            cfg = crypto_config(dict(cfg, crypto=doc.get("crypto")))
+    elif MARKET["crypto"]:
+        cfg = crypto_config(cfg)
     return cfg
 
 
@@ -597,7 +641,8 @@ def build_plan(a, now_utc):
     if info["or_high"] is not None and info["or_low"] is not None:
         orr = {"high": float(cents(info["or_high"])), "low": float(cents(info["or_low"])),
                "minutes": int(info["or_minutes"] or 15)}
-    plan = {"created_by": "trader-exit", "symbol": info["symbol"], "side": "buy", "date": day.isoformat(),
+    plan = {"created_by": "trader-exit", "symbol": info["symbol"], "side": "buy",
+            "market": "crypto" if MARKET["crypto"] else "stocks", "date": day.isoformat(),
             "setup": info["setup"], "entry": float(c["entry"]),
             "entry_time": ampm(entry_time) if entry_time else None,
             "entry_bar": info["entry_bar"], "interval": info["interval"], "opening_range": orr,
@@ -641,12 +686,26 @@ def describe(plan):
     out.append("  Stop          %s  %s%s" % (money(plan["stop"]), plan["stop_label"],
                                              (": " + plan["stop_detail"]) if plan.get("stop_detail") else ""))
     out.append("  Target        %s  %s" % (money(plan["target"]), plan["target_label"]))
-    out.append("  Risk a share  %s (%s%% of the entry)" % (money(plan["risk_per_share"]), pct))
+    out.append("  Risk a %s  %s (%s%% of the entry)" % ("coin " if MARKET["crypto"] else "share",
+                                                      money(plan["risk_per_share"]), pct))
     out.append("  Reward:risk   %s" % ratio(plan["reward_risk"]))
-    out.append("  Flat by       %s ET, win or lose: no overnight hold" % plan["flat_by"])
+    out.append("  Flat by       %s %s, win or lose: no overnight hold" % (plan["flat_by"], TZ))
     out.append("Set before the entry. If price hits the stop, you are out; never move it further away.")
     out.append(NOTE)
     return out
+
+
+def pick_market(a):
+    """Crypto mode when the symbol is a crypto pair (BTC-USD): from --symbol, the entry or the plan."""
+    sym = getattr(a, "symbol", None)
+    if not sym:
+        path = a.plan if a.cmd == "show" else (a.from_path or "trader/entry.json")
+        try:
+            with open(path, encoding="utf-8") as fh:
+                sym = (json.load(fh) or {}).get("symbol")
+        except (OSError, ValueError, AttributeError):
+            sym = None
+    use_market(is_crypto(sym))
 
 
 def cmd_plan(a):
@@ -709,10 +768,10 @@ def main(argv=None):
     p.add_argument("--side", default="buy", choices=["buy", "long", "sell", "short"], help="v2: buy only")
     p.add_argument("--stop", help="or-mid (orb default), or-low, price:X, pct:X, atr:K")
     p.add_argument("--target", help="2R (default), 1R, 1.5R, price:X")
-    p.add_argument("--flat-by", help="HH:MM New York (default: config flat_by, 15:55)")
+    p.add_argument("--flat-by", help="HH:MM New York (default: config flat_by, 15:55; crypto: UTC, 23:55)")
     p.add_argument("--config", default="trader/config.json")
     p.add_argument("--offline", metavar="PATH", help="saved Yahoo chart JSON for an atr stop")
-    p.add_argument("--now", help='pretend it is this New York time, e.g. "2026-10-19 10:15"')
+    p.add_argument("--now", help='pretend it is this New York time (UTC for crypto), e.g. "2026-10-19 10:15"')
     p.add_argument("--write", nargs="?", const="trader/plan.json", metavar="PATH",
                    help="save the plan (default trader/plan.json)")
     p.add_argument("--json", action="store_true")
@@ -725,6 +784,7 @@ def main(argv=None):
         ap.print_help()
         return 1
     try:
+        pick_market(a)
         return {"plan": cmd_plan, "show": cmd_show}[a.cmd](a)
     except PlanError as e:
         print("exit.py: %s" % e, file=sys.stderr)

@@ -103,6 +103,38 @@ NYSE_EARLY_CLOSE = {  # 1:00 p.m. ET, from https://www.nyse.com/markets/hours-ca
 }
 EARLY_MIN = 13 * 60
 
+TZ = "ET"
+
+# Crypto pairs (Yahoo's BTC-USD) trade around the clock. In crypto mode the day
+# is 00:00 to 24:00 UTC, every day of the year, and every clock in this tool
+# reads UTC instead of New York (the config's "crypto" section sets the times).
+CRYPTO = re.compile(r"^[A-Z0-9]{2,10}-(USD|USDT|USDC|EUR|GBP)$")
+CRYPTO_WINDOW = {"no_entries_before": "00:20", "no_entries_after": "23:00", "flat_by": "23:55"}  # UTC
+CRYPTO_FILL = 6   # crypto only: a gap of up to 6 missing bars (30 min, no trades on Yahoo) is filled flat
+MARKET = {"crypto": False}
+
+
+def is_crypto(sym):
+    return bool(CRYPTO.match(str(sym or "").strip().upper()))
+
+
+def use_market(crypto):
+    """Switch the whole tool to crypto time (UTC, every day, 288 five-minute bars from
+    midnight to midnight) or back to the NYSE session (78 bars, 9:30 to 16:00 ET)."""
+    global OPEN_MIN, CLOSE_MIN, SESSION_BARS, TZ
+    MARKET["crypto"] = bool(crypto)
+    OPEN_MIN, CLOSE_MIN, SESSION_BARS, TZ = (0, 24 * 60, 288, "UTC") if crypto else (9 * 60 + 30, 16 * 60, 78, "ET")
+
+
+def crypto_config(cfg):
+    """In crypto mode the times come from the config's "crypto" section (UTC), never
+    from the New York keys: 09:45 ET means nothing to a market that never closes."""
+    if not MARKET["crypto"]:
+        return cfg
+    out = dict(cfg, **CRYPTO_WINDOW)
+    out.update(cfg.get("crypto") or {})
+    return out
+
 
 class TMError(Exception):
     pass
@@ -120,6 +152,8 @@ def eastern_offset(utc):
     """Hours from UTC for New York: -4 in daylight time, -5 otherwise.
     DST runs from 2:00 a.m. on the second Sunday of March to 2:00 a.m. on the
     first Sunday of November (US rule since 2007)."""
+    if MARKET["crypto"]:
+        return 0  # crypto mode reads UTC
     y = utc.year
     start = datetime.datetime.combine(_nth_sunday(y, 3, 2), datetime.time(7, 0))   # 2:00 EST
     end = datetime.datetime.combine(_nth_sunday(y, 11, 1), datetime.time(6, 0))    # 2:00 EDT
@@ -132,6 +166,8 @@ def to_eastern(utc):
 
 
 def eastern_to_utc(local):
+    if MARKET["crypto"]:
+        return local
     for off in (-4, -5):
         utc = local - datetime.timedelta(hours=off)
         if eastern_offset(utc) == off:
@@ -161,7 +197,8 @@ def parse_clock(text, what):
     """'10:15 AM', '10:15am', '15:55' or '3:55' (a bare 1 to 8 o'clock means p.m.) -> minutes after midnight."""
     m = re.match(r"^\s*(\d{1,2}):(\d{2})\s*(?:([AaPp])\.?\s*[Mm]\.?)?\s*$", str(text or ""))
     if not m:
-        raise TMError("%s wants a New York time like 10:15 AM or 15:55, not %r" % (what, text))
+        raise TMError("%s wants a %s time like 10:15 AM or 15:55, not %r"
+                      % (what, "UTC" if MARKET["crypto"] else "New York", text))
     h, mi, ap = int(m.group(1)), int(m.group(2)), (m.group(3) or "").lower()
     if mi > 59 or h > 23 or (ap and not 1 <= h <= 12):
         raise TMError("%s %r is not a clock time" % (what, text))
@@ -169,12 +206,14 @@ def parse_clock(text, what):
         h += 12
     elif ap == "a" and h == 12:
         h = 0
-    elif not ap and 1 <= h <= 8:
-        h += 12
+    elif not ap and 1 <= h <= 8 and not MARKET["crypto"]:
+        h += 12   # stocks: 3:55 is p.m.; crypto reads a 24-hour UTC clock
     return h * 60 + mi
 
 
 def clock12(minutes):
+    if MARKET["crypto"]:
+        return clock24(minutes)   # UTC reads on a 24-hour clock
     h, m = divmod(minutes, 60)
     return "%d:%02d %s" % (h % 12 or 12, m, "AM" if h < 12 else "PM")
 
@@ -315,14 +354,35 @@ def split_sessions(bars):
     return days
 
 
+def fill_gaps(s, most=CRYPTO_FILL):
+    """Crypto only: Yahoo skips a 5-minute bar nobody traded in. A run of up to `most`
+    missing bars inside the day becomes flat bars at the last close (no move, no
+    volume); a longer gap, or a missing first or last bar, leaves the day short."""
+    if not s or 0 not in s or SESSION_BARS - 1 not in s:
+        return s
+    out, run = dict(s), []
+    for i in range(1, SESSION_BARS):
+        if i in s:
+            if len(run) > most:
+                return s
+            for j in run:
+                c = out[run[0] - 1]["c"]
+                out[j] = dict(out[run[0] - 1], slot=j, start=clock24(OPEN_MIN + 5 * j), o=c, h=c, l=c, v=0,
+                              filled=True)
+            run = []
+        else:
+            run.append(i)
+    return out
+
+
 def full_sessions(days, before):
-    """Full sessions (all 78 bars) strictly before the plan's date, oldest first,
-    and the short ones that were left out (half days, gaps)."""
+    """Full sessions (all 78 bars; 288 for crypto) strictly before the plan's date,
+    oldest first, and the short ones that were left out (half days, gaps)."""
     full, short = [], []
     for d in sorted(days):
         if d >= before:
             continue
-        s = days[d]
+        s = fill_gaps(days[d]) if MARKET["crypto"] else days[d]
         if len(s) == SESSION_BARS:
             full.append((d, [s[i] for i in range(SESSION_BARS)]))
         else:
@@ -569,8 +629,8 @@ def normalize_plan(raw, src="flags"):
     if k is None:
         raise TMError("the plan needs entry_time (the entry bar's close, e.g. 10:15 AM) or entry_bar")
     if not 0 <= k <= SESSION_BARS - 2:
-        raise TMError("the entry must close between 9:35 AM and 3:55 PM to leave bars to replay "
-                      "(got %s)" % clock12(OPEN_MIN + 5 * (k + 1)))
+        raise TMError("the entry must close between %s and %s to leave bars to replay (got %s)"
+                      % (clock12(OPEN_MIN + 5), clock12(CLOSE_MIN - 5), clock12(OPEN_MIN + 5 * (k + 1))))
     orng = raw.get("opening_range") or {}
     or_min = orng.get("minutes", 15) if isinstance(orng, dict) else 15
     try:
@@ -694,7 +754,7 @@ def time_machine(text, plan, now_utc, replays=10000, seed=19, window=2, until=No
     if not bars:
         raise TMError("no complete 5-minute bars for %s in the data" % sym)
     k = plan["entry_bar"]
-    early = plan["date"] in NYSE_EARLY_CLOSE
+    early = plan["date"] in NYSE_EARLY_CLOSE and not MARKET["crypto"]
     end_min = EARLY_MIN if early else CLOSE_MIN
     until_min = end_min if until is None else parse_clock(until, "--until")
     if (until_min - OPEN_MIN) % 5 or until_min > end_min:
@@ -740,9 +800,10 @@ def time_machine(text, plan, now_utc, replays=10000, seed=19, window=2, until=No
         "created_at": now_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
         "source": source,
         "data": {"symbol": msym or sym, "interval": "5m", "range": "60d",
-                 "last_bar": "%s %s ET" % (last_bar["date"], last_bar["start"]),
+                 "last_bar": "%s %s %s" % (last_bar["date"], last_bar["start"], TZ),
                  "dropped": dropped, "short_sessions_left_out": short},
         "plan": plan_out,
+        "market": "crypto" if MARKET["crypto"] else "stocks",
         "mc": mc,
         "history": history,
         "verdict": verdict(mc),
@@ -766,13 +827,15 @@ def report(doc):
     wd = WEEKDAYS[datetime.date.fromisoformat(p["date"]).weekday()]
     r = p["target_r"]
     lines = [
-        "%s %s, %s %s: entry %.2f at %s (bar %d), stop %.2f, target %.2f (%sR, risk %.2f a share)."
-        % (p["symbol"], p["side"], wd, p["date"], p["entry"], p["entry_time"], p["entry_bar"], p["stop"],
-           p["target"], ("%g" % r), p["risk_per_share"]),
+        "%s %s, %s %s: entry %.2f at %s%s (bar %d), stop %.2f, target %.2f (%sR, risk %.2f a %s)."
+        % (p["symbol"], p["side"], wd, p["date"], p["entry"], p["entry_time"], " UTC" if MARKET["crypto"] else "",
+           p["entry_bar"], p["stop"], p["target"], ("%g" % r), p["risk_per_share"],
+           "coin" if MARKET["crypto"] else "share"),
         "%s replays of the rest of the session, %s to %s (%d five-minute bars), seed %d."
         % ("{:,}".format(m["replays"]), p["entry_time"], until, m["bars_left"], m["seed"]),
         "Each bar is drawn whole from %s's own 5-min bars at the same time of day (+-%d bars) over its last "
-        "%d full sessions (%s to %s)." % (p["symbol"], m["window"], m["pool_sessions"], m["pool_from"], m["pool_to"]),
+        "%d full %s (%s to %s)." % (p["symbol"], m["window"], m["pool_sessions"],
+                                    "UTC days" if MARKET["crypto"] else "sessions", m["pool_from"], m["pool_to"]),
         "",
         "  target first   %s" % pc(m["p_target"]),
         "  stop first     %s" % pc(m["p_stop"]),
@@ -815,6 +878,12 @@ def render_chart(doc, height=17):
     """ASCII fan chart of the bands: one column per 5-min bar."""
     p, m = doc["plan"], doc["mc"]
     bands, times = m["bands"], m["band_times"]
+    if len(bands) > 120:   # a crypto day is 288 bars: one column per 15 or 20 minutes keeps it on screen
+        every = -(-len(bands) // 96)
+        keep = list(range(0, len(bands), every))
+        if keep[-1] != len(bands) - 1:
+            keep.append(len(bands) - 1)
+        bands, times = [bands[j] for j in keep], [times[j] for j in keep]
     lo = min([b[0] for b in bands] + [p["stop"], p["target"]])
     hi = max([b[4] for b in bands] + [p["stop"], p["target"]])
     pad = (hi - lo) * 0.04 or 0.01
@@ -847,7 +916,7 @@ def render_chart(doc, height=17):
     for j in sorted({0, len(bands) // 2, len(bands) - 1}):
         t = times[j]
         hh, mm = int(t[:2]), t[3:]
-        lab = "%d:%s" % (hh % 12 or 12, mm)
+        lab = t if MARKET["crypto"] else "%d:%s" % (hh % 12 or 12, mm)
         s = max(0, min(j, len(bands) - len(lab)))
         axis[s:s + len(lab)] = list(lab)
     out.append("          +" + "-" * len(bands))
@@ -875,6 +944,20 @@ def compute(a):
     else:
         text, source = fetch_chart(plan["symbol"]), "yahoo"
     return time_machine(text, plan, now, a.replays, a.seed, a.window, a.until, source)
+
+
+def pick_market(a):
+    """Crypto mode when the plan's symbol is a crypto pair (BTC-USD)."""
+    sym = a.symbol
+    path = a.from_file if a.cmd == "chart" and getattr(a, "from_file", None) else a.plan
+    if not sym and path and os.path.exists(path):
+        try:
+            with open(path, encoding="utf-8") as fh:
+                doc = json.load(fh) or {}
+            sym = doc.get("symbol") or (doc.get("plan") or {}).get("symbol")
+        except (OSError, ValueError, AttributeError):
+            sym = None
+    use_market(is_crypto(sym))
 
 
 def cmd_run(a):
@@ -928,7 +1011,8 @@ def main(argv=None):
         p.add_argument("--replays", type=int, default=10000)
         p.add_argument("--seed", type=int, default=19)
         p.add_argument("--window", type=int, default=2, help="draw from the same time of day +- this many bars")
-        p.add_argument("--until", help="end each replay at this time (default 16:00, the close)")
+        p.add_argument("--until", help="end each replay at this time (default 16:00, the close; crypto: "
+                                       "midnight UTC, or your flat-by like 23:55)")
         p.add_argument("--offline", metavar="FILE", help="a saved Yahoo chart JSON (.json or .json.gz), no network")
         p.add_argument("--now", help='pretend it is this time ("2026-10-19 10:15" New York, or ISO with Z)')
 
@@ -946,6 +1030,7 @@ def main(argv=None):
         ap.print_help()
         return 1
     try:
+        pick_market(a)
         return {"run": cmd_run, "chart": cmd_chart}[a.cmd](a)
     except TMError as e:
         print("timemachine.py: %s" % e, file=sys.stderr)
